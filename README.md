@@ -1,25 +1,39 @@
 # claude-sessions
 
-Save and restore the whole set of open Claude Code windows — which directories
-were open, which conversation each one was on, and where each window sat on
-screen — so restarting your machine doesn't cost you your working context.
+You have fourteen Claude Code windows open. Different repos, different
+conversations, each one carrying an hour of context you'd rather not rebuild.
+Then you need to reboot.
+
+The conversations survive — Claude Code writes every one of them to disk. What
+doesn't survive is knowing **which window was on which conversation**, and where
+it sat on your screen. Fourteen `claude --resume` pickers won't tell you that.
+
+`claude-sessions` records it and replays it.
+
+```bash
+claude-sessions save        # before you reboot
+claude-sessions restore     # after
+```
 
 Ships as a **Claude Code skill** and a standalone CLI.
 
-## The problem
+## What it does
 
-Claude Code already persists every conversation automatically:
+```mermaid
+flowchart LR
+  P["ps + lsof<br/>open claude windows"] --> M{"match each window<br/>to a conversation"}
+  W["iTerm2 / Terminal<br/>window bounds, by tty"] --> S
 
-```text
-~/.claude/projects/<cwd-with-/-and-.-as-dashes>/<session-uuid>.jsonl
+  M -->|"--resume id on argv"| S[("snapshot<br/>session-restore.json")]
+  M -->|"transcript born just<br/>after the process"| S
+  M -->|"nothing typed yet"| S
+
+  S --> R["restore<br/>skips what's already open"]
+  S --> F["find<br/>jump to the window"]
+  S --> A["arrange<br/>tile / cascade"]
+  T[("~/.claude/projects<br/>every transcript")] --> L["page<br/>local HTML library"]
+  S -.->|"open / archived state"| L
 ```
-
-So nothing is lost on restart, and for one window there's nothing to do —
-`claude -c` continues the last conversation here, `claude -r` opens a picker.
-
-But if you work with a dozen windows across a dozen repositories, the *layout*
-is gone: you can't remember which conversation each window was on, and a picker
-per directory won't tell you.
 
 ## Use
 
@@ -28,14 +42,9 @@ claude-sessions save              # snapshot the open windows
 claude-sessions list              # show it, with a title per session
 claude-sessions restore           # reopen what's missing, where it used to sit
 claude-sessions restore --dry-run # print the commands, open nothing
-claude-sessions restore --tabs    # ...as tabs in one window
-claude-sessions find gloss        # which window is that in? is it even open?
-claude-sessions find gloss --go   # bring it forward, or reopen it if it's closed
-claude-sessions page --open       # searchable page of every conversation
 claude-sessions doctor            # show exactly what it can and cannot see
 
 claude-sessions install-auto      # snapshot every 10 min via launchd
-claude-sessions uninstall-auto
 ```
 
 `list` reads like something human, because each entry carries a title taken from
@@ -43,19 +52,33 @@ the conversation's first message:
 
 ```text
 3 window(s), snapshot taken 2026-03-04 18:22:
-  /Users/you/dev/api-gateway   [open now]
+  ~/dev/api-gateway   [open now]
      3f2a9c14  rate limiter is dropping requests under load
-  /Users/you/dev/mobile-app
+  ~/dev/mobile-app
      7d4e1b90  migrate the onboarding flow off the old SDK
-  /Users/you/dev/infra   [remembered]
+  ~/dev/infra   [remembered]
      b81c5f37  terraform plan wants to replace the whole cluster
 ```
 
-*(illustrative — the real thing shows your own directories and conversations.)*
+`restore` reconciles rather than replays — it reopens only what isn't already
+open, so running it twice doesn't give you duplicates:
 
-## Finding a conversation again
+```text
+$ claude-sessions restore
+reopening 5 window(s) via iTerm2 (12 already open, skipped) ...
+reopened 5 of 5 window(s)
+```
+
+*(output above is illustrative)*
+
+## "Where's my gateway session — is it even open?"
 
 ```bash
+claude-sessions find gateway
+claude-sessions find gateway --go     # bring that window forward, or reopen it
+```
+
+```text
 $ claude-sessions find gateway
 2 match(es) for 'gateway':
   OPEN ~/dev/api-gateway  [ttys021, at 1518,757]
@@ -66,11 +89,9 @@ $ claude-sessions find gateway
         cd ~/dev/gateway-docs && claude --resume 8f84baff-...
 ```
 
-*(illustrative)*
-
-It searches directory, branch, first message and last message across every
-conversation, open or not. `--go` brings the top match's window forward if it's
-running, and reopens it if it isn't.
+It searches the directory, branch, opening prompt, last prompt and the whole
+thread of every conversation — open or not. `--go` brings the top match's window
+to the front if it's running, and reopens it if it isn't.
 
 ## Remembering what you closed
 
@@ -83,15 +104,17 @@ claude-sessions page --open         # browse the lot
 ```
 
 `page` writes a self-contained HTML file (`~/.claude/sessions.html`) listing
-every conversation: what you opened it with, **where you left off**, directory
-and branch, whether it's open / closed / archived, and a click-to-copy
-`claude --resume` command. Nothing is uploaded — it's a local file.
+every conversation you've had: what you opened it with, **where you left off**,
+directory and branch, whether it's open / closed / archived, and a click-to-copy
+`claude --resume` command.
 
-Click a conversation to drill in: every prompt you typed, with times. Search
+Click a conversation to drill in — every prompt you typed, with times. Search
 runs over those threads too, auto-opens the conversations that match and
 highlights the hits, so you can find a session by something you said halfway
-through it. `/` focuses search, Escape collapses, `--fast` skips reading the
+through it. `/` focuses search, `Escape` collapses, `--fast` skips reading the
 full transcripts.
+
+Nothing is uploaded. It's a local file.
 
 ## Arranging windows
 
@@ -104,7 +127,6 @@ claude-sessions arrange grid --busy-first    # sessions working right now get th
 claude-sessions arrange grid --rect 0,0,2560,1440   # confine to one display
 
 claude-sessions install-arrange grid --busy-first   # do it automatically
-claude-sessions uninstall-arrange
 ```
 
 `restore` also takes `--layout grid|cascade|saved|none`. The automatic mode
@@ -119,8 +141,9 @@ ln -s ~/dev/claude-sessions/skill ~/.claude/skills/claude-sessions          # as
 ln -s ~/dev/claude-sessions/skill/scripts/claude-sessions ~/.local/bin/     # as a CLI
 ```
 
-A skill is enumerated when a Claude Code window *starts*, so windows that were
-already open won't see it until they're restarted.
+No dependencies beyond python3 and macOS. A skill is enumerated when a Claude
+Code window *starts*, so windows that were already open won't see it until
+they're restarted.
 
 ## How it works
 
@@ -129,8 +152,8 @@ directory maps into `~/.claude/projects/` by replacing `/` and `.` with `-`.
 Window positions come from iTerm2/Terminal via the tty each process is on.
 
 Claude Code doesn't hold its transcript file open, so there's no direct
-process-to-session handle. Instead, each window is matched in three passes, and
-`doctor` tells you which one applied:
+process-to-session handle. Each window is matched in passes, and `doctor` tells
+you which one applied:
 
 | how | confidence | when |
 | --- | --- | --- |
@@ -146,29 +169,31 @@ A transcript that already existed *before* a process started is never matched to
 it. That matters more than it sounds: hooks and other tooling run headless
 `claude -p` jobs whose transcripts land in the same project directory, and a
 naive "most recently modified" match will hand your window someone else's
-conversation. For the same reason, discovery ignores headless processes,
-processes with no controlling terminal, and the helper `claude` children that a
-window forks.
+conversation. Transcripts are filtered by their `entrypoint` field — `cli` is a
+window you sat in front of, `sdk-cli`/`sdk-py` is a script. Discovery likewise
+ignores headless processes, processes with no controlling terminal, and the
+helper `claude` children a window forks.
 
 ## Two things it won't do to you
 
-**It never shrinks the snapshot.** `save` merges: a window that is no longer
+**It never shrinks the snapshot.** `save` merges: a window that's no longer
 running is remembered (for `--keep-hours`, default 72) rather than deleted. The
-failure mode that actually loses your work is a restore that half-succeeds
-followed by an automatic save overwriting the good snapshot with the smaller
-one. `save --replace` opts out. Every snapshot is also copied to
+failure that actually loses your work is a restore that half-succeeds followed
+by an automatic save overwriting the good snapshot with the smaller one.
+`save --replace` opts out. Every snapshot is also copied to
 `~/.claude/session-restore.d/` (last 30) — `list --history` and
 `restore --source <n>` go back.
 
-**It never fails silently.** `restore` reconciles against what's already open
-(so running it twice doesn't give you duplicates), verifies each window it
-creates, retries, and prints the exact command for anything it couldn't reopen.
+**It never fails silently.** `restore` verifies every window it creates, retries,
+and prints the exact command for anything it couldn't reopen. `doctor` says out
+loud when a window can't be identified or positioned.
 
 ## Scope
 
-macOS. Drives iTerm2 if it's running, Terminal otherwise. Read-only apart from
-one JSON file at `~/.claude/session-restore.json` (override with
-`CLAUDE_SESSIONS_STATE`); nothing is sent anywhere.
+macOS. Drives iTerm2 if it's running, Terminal otherwise — iTerm2 is the
+better-tested path. Read-only apart from two files under `~/.claude`
+(`session-restore.json`, override with `CLAUDE_SESSIONS_STATE`, and the
+generated `sessions.html`). Nothing is sent anywhere.
 
 ## Licence
 
