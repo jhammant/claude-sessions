@@ -1,6 +1,6 @@
 ---
 name: claude-sessions
-description: Save and restore the whole set of open Claude Code windows — which directories were open, which conversation each was on, and where each window sat on screen — so a machine restart doesn't cost you your working context. Also tiles the windows into a layout. Use when the user says "save my sessions", "restore my claude windows", "reopen everything", "I need to restart, don't lose my sessions", "how do I get all my windows back", "resume all my conversations", "arrange my claude windows", or asks how Claude Code session persistence works. Also use to set up an automatic periodic snapshot or automatic window arrangement.
+description: Save, restore, find and arrange Claude Code windows — which directories were open, which conversation each was on, where each window sat on screen — plus a searchable library of every past conversation. Use when the user says "save my sessions", "restore my claude windows", "reopen everything", "I need to restart, don't lose my sessions", "how do I get all my windows back", "resume all my conversations", "arrange my claude windows", "where is my <project> session", "find the window I was using for X", "which window is that in", "what was I doing in X", or asks how Claude Code session persistence works. Also use to set up an automatic periodic snapshot.
 ---
 
 # claude-sessions — save, restore and arrange your open Claude Code windows
@@ -33,6 +33,9 @@ claude-sessions restore             # reopen whatever is missing, where it used 
 claude-sessions restore --dry-run   # print the commands, open nothing
 claude-sessions restore --layout grid
 claude-sessions arrange grid        # retile the windows that are open right now
+claude-sessions find gloss          # which window is that in? is it even open?
+claude-sessions find gloss --go     # bring it forward, or reopen it if it's closed
+claude-sessions page --open         # searchable page of every conversation
 claude-sessions doctor              # show exactly what it can and cannot see
 ```
 
@@ -43,6 +46,46 @@ first user message so the list reads as something human.
 `restore` **reconciles** — it reopens only the windows that are not already
 open, so running it twice does not give you duplicates. Each window comes back
 at its saved position unless you ask for a different `--layout`.
+
+## Finding a conversation again
+
+```bash
+claude-sessions find gloss
+claude-sessions find "rate limiter" --go
+```
+
+`find` searches the directory, branch, first message and last message of every
+conversation — open or not. Open ones sort first and show the tty and screen
+position they are on. `--go` acts on the top match: it brings that window
+forward if it is running, and reopens it if it is not. This is the answer to
+"where is my X session, and is it even open?".
+
+## Remembering what you closed
+
+A window you deliberately closed should be remembered but not reopened:
+
+```bash
+claude-sessions archive --gone         # everything not open right now
+claude-sessions archive glossfm        # by directory fragment or session id
+claude-sessions archive glossfm --undo
+```
+
+`restore` leaves archived conversations closed (`--include-archived` overrides).
+
+```bash
+claude-sessions page --open            # everything, in a browser
+claude-sessions page --all --out ~/sessions.html
+```
+
+`page` writes a self-contained HTML file (default `~/.claude/sessions.html`)
+listing every real conversation on disk: what you opened it with, **where you
+left off**, the directory and branch, whether it is open / closed / archived,
+and a click-to-copy `claude --resume` command. It is a plain file — regenerate
+it whenever, nothing is uploaded.
+
+Only `entrypoint: cli` transcripts are listed. Hooks and scripts write
+`sdk-cli` / `sdk-py` transcripts into the same directories, and those are not
+conversations you had.
 
 ## Two things it will not do to you
 

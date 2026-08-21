@@ -21,6 +21,7 @@ sat on screen. This records that, and replays it.
 """
 
 import argparse
+import collections
 import glob
 import json
 import math
@@ -225,7 +226,34 @@ def project_dir(cwd):
     return d if os.path.isdir(d) else None
 
 
-def transcripts(cwd):
+def head(path, lines=40, cap=262144):
+    """First few records of a transcript, cheaply."""
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            read = 0
+            for i, line in enumerate(fh):
+                if i >= lines or read > cap:
+                    break
+                read += len(line)
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def entrypoint(path):
+    """'cli' for a real window; 'sdk-cli'/'sdk-py' for hook and script runs."""
+    for d in head(path, lines=30):
+        if "entrypoint" in d:
+            return d["entrypoint"]
+    return None
+
+
+def transcripts(cwd, interactive_only=True):
     d = project_dir(cwd)
     if not d:
         return []
@@ -235,6 +263,8 @@ def transcripts(cwd):
             st = os.stat(f)
         except OSError:
             continue
+        if interactive_only and entrypoint(f) not in (None, "cli"):
+            continue      # a hook's headless run, not a window
         out.append({"file": f, "id": os.path.basename(f)[:-6],
                     "born": getattr(st, "st_birthtime", st.st_ctime), "mtime": st.st_mtime})
     return out
@@ -569,6 +599,9 @@ def cmd_restore(args):
         print("no snapshot — run: claude-sessions save")
         return 1
     rows = [r for r in d["saved"] if r.get("session")]
+    archived = [r for r in rows if r.get("archived")]
+    if archived and not args.include_archived:
+        rows = [r for r in rows if not r.get("archived")]
 
     running = {(w["cwd"], w.get("session")) for w in match_sessions(discover())}
     skipped = [r for r in rows if (r["cwd"], r["session"]) in running]
@@ -576,8 +609,13 @@ def cmd_restore(args):
         rows = [r for r in rows if (r["cwd"], r["session"]) not in running]
 
     if not rows:
-        print("nothing to reopen — all %d window(s) in the snapshot are already open" % len(skipped))
+        print("nothing to reopen — all %d window(s) in the snapshot are already open%s"
+              % (len(skipped),
+                 " (%d archived, --include-archived to reopen those)" % len(archived)
+                 if archived else ""))
         return 0
+    if archived and not args.include_archived:
+        print("(%d archived window(s) left closed — see `claude-sessions page`)" % len(archived))
 
     rects = layout_rects(rows, args.layout, cols=args.cols, rect=args.rect)
 
@@ -733,6 +771,379 @@ def arrange_once(args):
     return 0
 
 
+# ---------------------------------------------------------------- library
+
+def tail_user(path, window=196608):
+    """The last thing you actually said in a conversation — 'where I left off'."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - window))
+            chunk = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return "", None
+    lines = chunk.splitlines()
+    if size > window and lines:
+        lines = lines[1:]                       # first line is probably cut in half
+    last_ts = None
+    text = ""
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if last_ts is None and d.get("timestamp"):
+            last_ts = d["timestamp"]
+        if text or d.get("type") != "user" or d.get("isSidechain"):
+            continue
+        c = d.get("message", {}).get("content")
+        if isinstance(c, list):
+            c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+        if isinstance(c, str) and c.strip() and not c.startswith("<"):
+            text = " ".join(c.split())[:280]
+    return text, last_ts
+
+
+def scan_library(days=None, deep=False):
+    """Every real conversation on disk, newest first, with enough to recognise it."""
+    cutoff = time.time() - days * 86400 if days else 0
+    rows = []
+    for f in glob.glob(os.path.join(PROJ, "*", "*.jsonl")):
+        try:
+            st = os.stat(f)
+        except OSError:
+            continue
+        if st.st_mtime < cutoff or st.st_size == 0:
+            continue
+        recs = head(f)
+        ep = next((d["entrypoint"] for d in recs if "entrypoint" in d), None)
+        if ep not in (None, "cli"):
+            continue
+        cwd = next((d["cwd"] for d in recs if d.get("cwd")), None)
+        if not cwd:
+            continue
+        branch = next((d.get("gitBranch") for d in recs if d.get("gitBranch")), "")
+        started = next((d["timestamp"] for d in recs if d.get("timestamp")), None)
+        first = ""
+        for d in recs:
+            if d.get("type") == "user" and not d.get("isSidechain"):
+                c = d.get("message", {}).get("content")
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                if isinstance(c, str) and c.strip() and not c.startswith("<"):
+                    first = " ".join(c.split())[:200]
+                    break
+        if not first:
+            first = title(f)[:200]
+        last, last_ts = tail_user(f)
+        rows.append({"cwd": cwd, "branch": branch or "", "session": os.path.basename(f)[:-6],
+                     "first": first, "last": last, "started": started,
+                     "ended": last_ts or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime)),
+                     "mtime": int(st.st_mtime), "bytes": st.st_size})
+    rows.sort(key=lambda r: -r["mtime"])
+    return rows
+
+
+PAGE = """<title>Claude Code sessions</title>
+<style>
+  :root {
+    --bg:#faf9f7; --panel:#fff; --ink:#1d1b17; --muted:#6d675e; --line:#e6e2db;
+    --accent:#a8562a; --chip:#f1ede6; --open:#2f7d4f; --arch:#8a7f70;
+  }
+  :root:not([data-theme=light]) { }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme=light]) {
+      --bg:#14130f; --panel:#1c1a16; --ink:#eeeae2; --muted:#9c9486; --line:#2e2a24;
+      --accent:#e08a55; --chip:#26231d; --open:#6fc48d; --arch:#7d7466;
+    }
+  }
+  :root[data-theme=dark] {
+    --bg:#14130f; --panel:#1c1a16; --ink:#eeeae2; --muted:#9c9486; --line:#2e2a24;
+    --accent:#e08a55; --chip:#26231d; --open:#6fc48d; --arch:#7d7466;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.5 ui-sans-serif,-apple-system,"SF Pro Text",Segoe UI,sans-serif; }
+  header { position:sticky; top:0; background:var(--bg); border-bottom:1px solid var(--line);
+    padding:18px 24px 14px; z-index:5; }
+  h1 { margin:0 0 2px; font-size:19px; letter-spacing:-.01em; font-weight:650; }
+  .sub { color:var(--muted); font-size:13px; }
+  .controls { display:flex; gap:10px; margin-top:12px; flex-wrap:wrap; }
+  input[type=search], select { background:var(--panel); color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:8px 11px; font:inherit; font-size:14px; }
+  input[type=search] { flex:1; min-width:220px; }
+  main { padding:8px 24px 60px; max-width:1080px; }
+  .grp { margin-top:26px; }
+  .grp h2 { font-size:13px; font-weight:650; color:var(--muted); margin:0 0 8px;
+    letter-spacing:.02em; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:11px;
+    padding:13px 15px; margin-bottom:9px; }
+  .card .t { font-weight:600; margin-bottom:5px; }
+  .card .l { color:var(--muted); font-size:13.5px; }
+  .card .l b { color:var(--ink); font-weight:600; }
+  .meta { margin-top:9px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    font-size:12px; color:var(--muted); }
+  .chip { background:var(--chip); border-radius:999px; padding:2px 9px; }
+  .chip.open { color:var(--open); font-weight:600; }
+  .chip.arch { color:var(--arch); }
+  button.cmd { margin-left:auto; background:none; border:1px solid var(--line); color:var(--accent);
+    border-radius:7px; padding:4px 10px; font:inherit; font-size:12px; cursor:pointer;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  button.cmd:hover { border-color:var(--accent); }
+  .empty { color:var(--muted); padding:40px 0; }
+</style>
+<header>
+  <h1>Claude Code sessions</h1>
+  <div class="sub" id="sub"></div>
+  <div class="controls">
+    <input type="search" id="q" placeholder="search what you were doing, a directory, a branch…" autofocus>
+    <select id="state">
+      <option value="">everything</option>
+      <option value="open">open now</option>
+      <option value="closed">closed</option>
+      <option value="archived">archived</option>
+    </select>
+    <select id="grp">
+      <option value="cwd">group by directory</option>
+      <option value="day">group by day</option>
+      <option value="">no grouping</option>
+    </select>
+  </div>
+</header>
+<main id="out"></main>
+<script>
+const DATA = __DATA__;
+const esc = s => (s||"").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const short = p => p.replace(new RegExp("^/Users/[^/]+/"), "~/");
+const when = t => { const d = new Date(t); return isNaN(d) ? "" :
+  d.toLocaleDateString(undefined,{month:"short",day:"numeric"}) + " " +
+  d.toLocaleTimeString(undefined,{hour:"2-digit",minute:"2-digit"}); };
+function render() {
+  const q = document.getElementById("q").value.toLowerCase().trim();
+  const st = document.getElementById("state").value;
+  const gb = document.getElementById("grp").value;
+  let rows = DATA.filter(r =>
+    (!st || r.state === st) &&
+    (!q || (r.cwd + " " + r.first + " " + r.last + " " + r.branch).toLowerCase().includes(q)));
+  const out = document.getElementById("out");
+  document.getElementById("sub").textContent =
+    rows.length + " of " + DATA.length + " conversations · click a command to copy it";
+  if (!rows.length) { out.innerHTML = '<div class="empty">Nothing matches.</div>'; return; }
+  const groups = new Map();
+  for (const r of rows) {
+    const k = gb === "cwd" ? short(r.cwd)
+            : gb === "day" ? new Date(r.mtime*1000).toDateString() : "";
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(r);
+  }
+  out.innerHTML = [...groups].map(([k, rs]) => `
+    <section class="grp">${k ? `<h2>${esc(k)}</h2>` : ""}
+    ${rs.map(r => `
+      <div class="card">
+        <div class="t">${esc(r.first) || "<em>no prompt yet</em>"}</div>
+        ${r.last && r.last !== r.first ? `<div class="l"><b>left off:</b> ${esc(r.last)}</div>` : ""}
+        <div class="meta">
+          <span class="chip ${r.state === "open" ? "open" : r.state === "archived" ? "arch" : ""}">${r.state}</span>
+          ${gb === "cwd" ? "" : `<span class="chip">${esc(short(r.cwd))}</span>`}
+          ${r.branch ? `<span class="chip">${esc(r.branch)}</span>` : ""}
+          <span>${when(r.ended)}</span>
+          <button class="cmd" data-c="cd ${esc(r.cwd)} &amp;&amp; claude --resume ${r.session}">resume ↗</button>
+        </div>
+      </div>`).join("")}
+    </section>`).join("");
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest("button.cmd"); if (!b) return;
+  const text = b.dataset.c;
+  const done = () => { const o = b.textContent; b.textContent = "copied ✓";
+    setTimeout(() => b.textContent = o, 1400); };
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, fallback);
+  else fallback();
+  function fallback() {
+    const ta = document.createElement("textarea"); ta.value = text;
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); done(); } catch (_) { prompt("Copy:", text); }
+    ta.remove();
+  }
+});
+for (const id of ["q", "state", "grp"])
+  document.getElementById(id).addEventListener("input", render);
+render();
+</script>
+"""
+
+
+def cmd_page(args):
+    rows = scan_library(days=None if args.all else args.days)
+    live = {w.get("session") for w in match_sessions(discover())}
+    snap = load() or {"saved": []}
+    arch = {r["session"] for r in snap["saved"] if r.get("archived")}
+    remembered = {r["session"] for r in snap["saved"] if not r.get("archived")}
+    for r in rows:
+        r["state"] = ("open" if r["session"] in live
+                      else "archived" if r["session"] in arch
+                      else "remembered" if r["session"] in remembered
+                      else "closed")
+    out = os.path.expanduser(args.out)
+    # a conversation that mentions </script> would otherwise end the script block
+    blob = json.dumps(rows).replace("</", "<\\/")
+    html = PAGE.replace("__DATA__", blob)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    with open(out, "w") as fh:
+        fh.write("<!doctype html><meta charset=utf-8>"
+                 "<meta name=viewport content=\"width=device-width,initial-scale=1\">" + html)
+    n = collections.Counter(r["state"] for r in rows)
+    print("%d conversation(s) -> %s" % (len(rows), out))
+    print("  " + ", ".join("%d %s" % (v, k) for k, v in n.most_common()))
+    if args.open:
+        sh(["open", out])
+    return 0
+
+
+def cmd_archive(args):
+    """Mark windows you closed on purpose: remembered on the page, never reopened."""
+    d = load()
+    if not d:
+        print("no snapshot yet — run: claude-sessions save")
+        return 1
+    running = {w.get("session") for w in match_sessions(discover())}
+    hit = 0
+    for r in d["saved"]:
+        sid = r.get("session")
+        if not sid:
+            continue
+        match = (args.gone and sid not in running) or any(
+            t in r["cwd"] or sid.startswith(t) for t in args.what)
+        if match and not r.get("archived"):
+            if args.undo:
+                continue
+            r["archived"] = True
+            r["live"] = False
+            hit += 1
+        elif match and args.undo:
+            r.pop("archived", None)
+            hit += 1
+    if not hit:
+        print("nothing matched")
+        return 1
+    write_snapshot(d["saved"])
+    print("%s %d conversation(s)" % ("un-archived" if args.undo else "archived", hit))
+    print("  they stay in `claude-sessions page`; `restore` will leave them closed")
+    return 0
+
+
+FOCUS_ITERM = """
+tell application "iTerm2"
+  repeat with w in windows
+    try
+      if (tty of first session of first tab of w) is "%s" then
+        select w
+        activate
+        return "ok"
+      end if
+    end try
+  end repeat
+  return ""
+end tell
+"""
+
+FOCUS_TERMINAL = """
+tell application "Terminal"
+  repeat with w in windows
+    try
+      if (tty of first tab of w) is "%s" then
+        set index of w to 1
+        activate
+        return "ok"
+      end if
+    end try
+  end repeat
+  return ""
+end tell
+"""
+
+
+def focus(tty, app):
+    tmpl = FOCUS_ITERM if app == "iTerm2" else FOCUS_TERMINAL
+    rc, out, err = osa(tmpl % tty)
+    return rc == 0 and out == "ok"
+
+
+def cmd_find(args):
+    """Where is my <thing> session — and is it already open?"""
+    q = " ".join(args.query).lower()
+    if not q:
+        print("give me something to look for, e.g. `claude-sessions find gloss`")
+        return 1
+
+    wins = {w.get("session"): w for w in match_sessions(discover()) if w.get("session")}
+    geo = geometry()
+    rows = scan_library(days=None if args.all else args.days)
+    snap = load() or {"saved": []}
+    arch = {r["session"] for r in snap["saved"] if r.get("archived")}
+
+    hits = []
+    for r in rows:
+        hay = " ".join([r["cwd"], r["first"], r["last"], r["branch"], r["session"]]).lower()
+        if q not in hay:
+            continue
+        r["open"] = r["session"] in wins
+        r["archived"] = r["session"] in arch
+        # a match in the directory name is what you usually mean by "my gloss session"
+        r["score"] = (0 if r["open"] else 1, 0 if q in r["cwd"].lower() else 1, -r["mtime"])
+        hits.append(r)
+    hits.sort(key=lambda r: r["score"])
+
+    if not hits:
+        print("nothing matching %r in the last %s" % (q, "of time" if args.all else "%d days" % args.days))
+        return 1
+
+    if args.go:
+        r = hits[0]
+        if r["open"]:
+            w = wins[r["session"]]
+            app = geo.get(w["tty"], {}).get("term") or terminal_app()
+            if focus(w["tty"], app):
+                print("brought forward: %s" % r["cwd"])
+                print("  %s" % (r["last"] or r["first"])[:110])
+                return 0
+            print("that window is open (%s, %s) but would not come forward" % (r["cwd"], w["tty"]))
+            return 1
+        row = {"cwd": r["cwd"], "session": r["session"]}
+        term = terminal_app()
+        if not term:
+            print("neither iTerm2 nor Terminal is running")
+            return 1
+        ok, out = open_window(term, build_cmd(row), None)
+        print(("reopened " if ok else "FAILED to reopen ") + r["cwd"])
+        if not ok:
+            print("  %s" % build_cmd(row))
+        return 0 if ok else 1
+
+    print("%d match(es) for %r:" % (len(hits), q))
+    for r in hits[:args.limit]:
+        mark = "OPEN " if r["open"] else "arch " if r["archived"] else "     "
+        w = wins.get(r["session"])
+        where = ""
+        if w:
+            b = geo.get(w["tty"], {}).get("bounds")
+            where = "  [%s%s]" % (w["tty"].replace("/dev/", ""),
+                                  ", at %d,%d" % (b[0], b[1]) if b else "")
+        print("  %s%s%s" % (mark, r["cwd"], where))
+        print("        %s" % (r["first"] or "(no prompt yet)")[:100])
+        if r["last"] and r["last"] != r["first"]:
+            print("        left off: %s" % r["last"][:100])
+        if not r["open"]:
+            print("        cd %s && claude --resume %s" % (shlex.quote(r["cwd"]), r["session"]))
+    if len(hits) > args.limit:
+        print("  ... and %d more" % (len(hits) - args.limit))
+    if hits[0]["open"]:
+        print("\n`claude-sessions find %s --go` brings that window forward" % q)
+    else:
+        print("\n`claude-sessions find %s --go` reopens the top match" % q)
+    return 0
+
+
 def cmd_doctor(args):
     wins = match_sessions(discover())
     geo = geometry()
@@ -875,6 +1286,8 @@ def main():
     s.add_argument("--force", action="store_true", help="reopen even what is already open")
     s.add_argument("--pace", type=float, default=0.5, help="seconds between windows")
     s.add_argument("--source", help="snapshot file, or an index from `list --history`")
+    s.add_argument("--include-archived", action="store_true",
+                   help="also reopen conversations you archived")
     s.set_defaults(fn=cmd_restore)
 
     s = sub.add_parser("arrange", help="retile the windows that are open now")
@@ -899,6 +1312,28 @@ def main():
 
     s = sub.add_parser("uninstall-arrange")
     s.set_defaults(fn=cmd_uninstall_arrange)
+
+    s = sub.add_parser("page", help="browsable HTML page of every conversation")
+    s.add_argument("--out", default="~/.claude/sessions.html")
+    s.add_argument("--days", type=int, default=45)
+    s.add_argument("--all", action="store_true", help="every conversation ever, not just recent")
+    s.add_argument("--open", action="store_true", help="open it in the browser")
+    s.set_defaults(fn=cmd_page)
+
+    s = sub.add_parser("archive", help="remember a conversation but stop reopening it")
+    s.add_argument("what", nargs="*", help="directory fragment or session id prefix")
+    s.add_argument("--gone", action="store_true", help="archive everything not open right now")
+    s.add_argument("--undo", action="store_true")
+    s.set_defaults(fn=cmd_archive)
+
+    s = sub.add_parser("find", help="find a conversation, open or closed, and jump to it")
+    s.add_argument("query", nargs="+")
+    s.add_argument("--go", action="store_true",
+                   help="bring the top match's window forward, or reopen it if it is closed")
+    s.add_argument("--days", type=int, default=90)
+    s.add_argument("--all", action="store_true")
+    s.add_argument("--limit", type=int, default=8)
+    s.set_defaults(fn=cmd_find)
 
     s = sub.add_parser("doctor", help="show what it can and cannot see")
     s.set_defaults(fn=cmd_doctor)

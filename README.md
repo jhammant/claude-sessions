@@ -29,6 +29,9 @@ claude-sessions list              # show it, with a title per session
 claude-sessions restore           # reopen what's missing, where it used to sit
 claude-sessions restore --dry-run # print the commands, open nothing
 claude-sessions restore --tabs    # ...as tabs in one window
+claude-sessions find gloss        # which window is that in? is it even open?
+claude-sessions find gloss --go   # bring it forward, or reopen it if it's closed
+claude-sessions page --open       # searchable page of every conversation
 claude-sessions doctor            # show exactly what it can and cannot see
 
 claude-sessions install-auto      # snapshot every 10 min via launchd
@@ -49,6 +52,38 @@ the conversation's first message:
 ```
 
 *(illustrative — the real thing shows your own directories and conversations.)*
+
+## Finding a conversation again
+
+```bash
+$ claude-sessions find gloss
+2 match(es) for 'gloss':
+  OPEN ~/dev  [ttys033, at 792,729]
+        how can i get glossfm ready to launch, even if just a small test
+        left off: could we monetise the free login with ads?
+       ~/dev/glossfm
+        Podcast player built for learning
+        cd ~/dev/glossfm && claude --resume 8f84baff-...
+```
+
+It searches directory, branch, first message and last message across every
+conversation, open or not. `--go` brings the top match's window forward if it's
+running, and reopens it if it isn't.
+
+## Remembering what you closed
+
+A window you closed on purpose should be remembered, not reopened:
+
+```bash
+claude-sessions archive --gone      # everything not open right now
+claude-sessions archive glossfm     # or by directory / session id
+claude-sessions page --open         # browse the lot
+```
+
+`page` writes a self-contained HTML file (`~/.claude/sessions.html`) listing
+every conversation: what you opened it with, **where you left off**, directory
+and branch, whether it's open / closed / archived, and a click-to-copy
+`claude --resume` command. Nothing is uploaded — it's a local file.
 
 ## Arranging windows
 
