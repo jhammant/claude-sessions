@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# claude-sessions — snapshot the open Claude Code windows and reopen them later.
+#
+# Claude Code already persists every conversation to
+#   ~/.claude/projects/<cwd-with-/-and-.-as-dashes>/<session-uuid>.jsonl
+# so nothing needs "saving". What is lost on restart is the WINDOW LAYOUT: which
+# directories were open and which conversation each one was on. This records
+# that, and replays it.
+#
+#   claude-sessions save            snapshot the currently open windows
+#   claude-sessions list            show what is in the snapshot
+#   claude-sessions restore         reopen them all (iTerm2, else Terminal)
+#   claude-sessions restore --tabs  reopen as tabs in one window
+#   claude-sessions restore --dry-run   print the commands, open nothing
+#   claude-sessions install-auto [secs]  snapshot periodically via launchd
+#   claude-sessions uninstall-auto
+set -uo pipefail
+STATE="${CLAUDE_SESSIONS_STATE:-$HOME/.claude/session-restore.json}"
+PROJ="$HOME/.claude/projects"
+
+encode() { printf '%s' "$1" | sed 's|[/.]|-|g'; }
+
+save() {
+  local pids; pids=$(pgrep -x claude || true)
+  [ -z "$pids" ] && { echo "no running claude windows"; exit 0; }
+  # cwd per pid
+  local tmp; tmp=$(mktemp)
+  for p in $pids; do
+    lsof -a -p "$p" -d cwd -Fn 2>/dev/null | grep '^n' | cut -c2- >> "$tmp"
+  done
+  python3 - "$tmp" "$PROJ" "$STATE" <<'PY'
+import json, os, re, sys, collections, glob
+cwds = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+proj, state = sys.argv[2], sys.argv[3]
+def enc(p): return re.sub(r'[/.]', '-', p)
+def title(f):
+    try:
+        with open(f, encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                try: d = json.loads(line)
+                except Exception: continue
+                if d.get('type') == 'user':
+                    m = d.get('message', {})
+                    c = m.get('content')
+                    if isinstance(c, list):
+                        c = ' '.join(x.get('text','') for x in c if isinstance(x, dict))
+                    if isinstance(c, str) and c.strip() and not c.startswith('<'):
+                        return ' '.join(c.split())[:90]
+    except Exception: pass
+    return ''
+out = []
+for cwd, n in sorted(collections.Counter(cwds).items()):
+    d = os.path.join(proj, enc(cwd))
+    files = sorted(glob.glob(os.path.join(d, '*.jsonl')),
+                   key=os.path.getmtime, reverse=True)[:n]
+    if not files:
+        out.append({"cwd": cwd, "session": None, "title": "(no transcript found)"})
+        continue
+    for f in files:
+        out.append({"cwd": cwd,
+                    "session": os.path.basename(f)[:-6],
+                    "mtime": int(os.path.getmtime(f)),
+                    "title": title(f)})
+out.sort(key=lambda r: (-(r.get('mtime') or 0)))
+os.makedirs(os.path.dirname(state), exist_ok=True)
+json.dump({"saved": out}, open(state, 'w'), indent=2)
+print(f"saved {len(out)} session(s) -> {state}")
+PY
+  rm -f "$tmp"
+}
+
+list_() {
+  [ -f "$STATE" ] || { echo "no snapshot yet — run: claude-sessions save"; exit 1; }
+  python3 - "$STATE" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))["saved"]
+print(f"{len(d)} session(s):")
+for r in d:
+    print(f"  {r['cwd']}")
+    print(f"     {r['session'] or '-'}  {r.get('title','')[:76]}")
+PY
+}
+
+restore() {
+  [ -f "$STATE" ] || { echo "no snapshot — run: claude-sessions save"; exit 1; }
+  local mode="${1:-windows}"
+  if [ "$mode" = "--dry-run" ]; then
+    python3 - "$STATE" <<'PY2'
+import json,shlex,sys
+for r in json.load(open(sys.argv[1]))["saved"]:
+    c=f"cd {shlex.quote(r['cwd'])} && claude"
+    if r.get("session"): c+=f" --resume {r['session']}"
+    print("  "+c)
+PY2
+    exit 0
+  fi
+  local term="Terminal"
+  osascript -e 'tell application "System Events" to (name of processes) contains "iTerm2"' 2>/dev/null | grep -q true && term="iTerm2"
+  echo "reopening via $term ..."
+  python3 - "$STATE" "$term" "$mode" <<'PY'
+import json, subprocess, sys, shlex
+rows = json.load(open(sys.argv[1]))["saved"]
+term, mode = sys.argv[2], sys.argv[3]
+def cmd(r):
+    c = f"cd {shlex.quote(r['cwd'])} && claude"
+    if r.get("session"): c += f" --resume {r['session']}"
+    return c
+for i, r in enumerate(rows):
+    c = cmd(r).replace('\\', '\\\\').replace('"', '\\"')
+    if term == "iTerm2":
+        if mode == "--tabs" and i:
+            s = f'tell application "iTerm2" to tell current window to tell (create tab with default profile) to tell current session to write text "{c}"'
+        else:
+            s = f'tell application "iTerm2" to tell (create window with default profile) to tell current session to write text "{c}"'
+    else:
+        s = f'tell application "Terminal" to do script "{c}"'
+    subprocess.run(["osascript", "-e", s], check=False)
+print(f"reopened {len(rows)} window(s)")
+PY
+}
+
+PLIST="$HOME/Library/LaunchAgents/com.jhammant.claude-sessions.plist"
+
+install_auto() {
+  local self; self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  mkdir -p "$(dirname "$PLIST")"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.jhammant.claude-sessions</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>$self</string><string>save</string></array>
+  <key>StartInterval</key><integer>${1:-600}</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardErrorPath</key><string>/tmp/claude-sessions.err</string>
+</dict></plist>
+EOF
+  launchctl unload "$PLIST" 2>/dev/null
+  launchctl load "$PLIST" 2>/dev/null
+  echo "auto-save installed: every ${1:-600}s -> $STATE"
+  echo "  (snapshots only while at least one claude window is open)"
+}
+
+uninstall_auto() {
+  launchctl unload "$PLIST" 2>/dev/null
+  rm -f "$PLIST"
+  echo "auto-save removed"
+}
+
+case "${1:-}" in
+  save) save ;;
+  install-auto) shift; install_auto "${1:-600}" ;;
+  uninstall-auto) uninstall_auto ;;
+  list) list_ ;;
+  restore) shift; restore "${1:-windows}" ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac
