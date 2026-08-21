@@ -119,7 +119,7 @@ print(f"reopened {len(rows)} window(s)")
 PY
 }
 
-PLIST="$HOME/Library/LaunchAgents/com.jhammant.claude-sessions.plist"
+PLIST="$HOME/Library/LaunchAgents/dev.claudesessions.snapshot.plist"
 
 install_auto() {
   local self; self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
@@ -129,7 +129,7 @@ install_auto() {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.jhammant.claude-sessions</string>
+  <key>Label</key><string>dev.claudesessions.snapshot</string>
   <key>ProgramArguments</key>
   <array><string>/bin/bash</string><string>$self</string><string>save</string></array>
   <key>StartInterval</key><integer>${1:-600}</integer>

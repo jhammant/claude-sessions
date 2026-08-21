@@ -38,12 +38,16 @@ claude-sessions uninstall-auto
 the conversation's first message:
 
 ```
-17 session(s):
-  /Users/you/dev/orbital
-     1467b23b-…  I've got a meeting with the exec team…
-  /Users/you/dev/ClaudeCodeToVoice
-     de6fc9f6-…  I want to build something that enables voice with claude code…
+3 session(s):
+  /Users/you/dev/api-gateway
+     3f2a9c14-0b7e-4d51-9a63-8c1d0e5f7b22  rate limiter is dropping requests under load
+  /Users/you/dev/mobile-app
+     7d4e1b90-6c2f-4a83-b715-2e9f0a3c8d61  migrate the onboarding flow off the old SDK
+  /Users/you/dev/infra
+     b81c5f37-9a04-42de-8f16-0d7b3e6a2c45  terraform plan wants to replace the whole cluster
 ```
+
+*(illustrative — the real thing shows your own directories and conversations.)*
 
 ## Install
 
