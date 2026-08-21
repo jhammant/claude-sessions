@@ -1,159 +1,921 @@
-#!/usr/bin/env bash
-# claude-sessions — snapshot the open Claude Code windows and reopen them later.
-#
-# Claude Code already persists every conversation to
-#   ~/.claude/projects/<cwd-with-/-and-.-as-dashes>/<session-uuid>.jsonl
-# so nothing needs "saving". What is lost on restart is the WINDOW LAYOUT: which
-# directories were open and which conversation each one was on. This records
-# that, and replays it.
-#
-#   claude-sessions save            snapshot the currently open windows
-#   claude-sessions list            show what is in the snapshot
-#   claude-sessions restore         reopen them all (iTerm2, else Terminal)
-#   claude-sessions restore --tabs  reopen as tabs in one window
-#   claude-sessions restore --dry-run   print the commands, open nothing
-#   claude-sessions install-auto [secs]  snapshot periodically via launchd
-#   claude-sessions uninstall-auto
-set -uo pipefail
-STATE="${CLAUDE_SESSIONS_STATE:-$HOME/.claude/session-restore.json}"
-PROJ="$HOME/.claude/projects"
+#!/usr/bin/env python3
+"""claude-sessions — snapshot the open Claude Code windows and reopen them later.
 
-encode() { printf '%s' "$1" | sed 's|[/.]|-|g'; }
+Claude Code already persists every conversation to
+    ~/.claude/projects/<cwd-with-/-and-.-as-dashes>/<session-uuid>.jsonl
+so nothing needs "saving". What is lost on restart is the WINDOW LAYOUT: which
+directories were open, which conversation each one was on, and where each window
+sat on screen. This records that, and replays it.
 
-save() {
-  local pids; pids=$(pgrep -x claude || true)
-  [ -z "$pids" ] && { echo "no running claude windows"; exit 0; }
-  # cwd per pid
-  local tmp; tmp=$(mktemp)
-  for p in $pids; do
-    lsof -a -p "$p" -d cwd -Fn 2>/dev/null | grep '^n' | cut -c2- >> "$tmp"
-  done
-  python3 - "$tmp" "$PROJ" "$STATE" <<'PY'
-import json, os, re, sys, collections, glob
-cwds = [l.strip() for l in open(sys.argv[1]) if l.strip()]
-proj, state = sys.argv[2], sys.argv[3]
-def enc(p): return re.sub(r'[/.]', '-', p)
-def title(f):
+    claude-sessions save                 snapshot the open windows (merges, never shrinks)
+    claude-sessions save --replace       snapshot exactly what is open right now
+    claude-sessions list                 show the snapshot
+    claude-sessions list --history       show previous snapshots
+    claude-sessions restore              reopen what is missing, in its saved position
+    claude-sessions restore --dry-run    print what it would do
+    claude-sessions restore --layout grid
+    claude-sessions arrange grid         retile the windows that are open now
+    claude-sessions doctor               show what it can and cannot see
+    claude-sessions install-auto [secs]  periodic snapshot via launchd
+    claude-sessions uninstall-auto
+"""
+
+import argparse
+import glob
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+STATE = os.environ.get("CLAUDE_SESSIONS_STATE", os.path.join(HOME, ".claude", "session-restore.json"))
+HISTDIR = os.environ.get("CLAUDE_SESSIONS_HISTORY", os.path.join(HOME, ".claude", "session-restore.d"))
+PROJ = os.path.join(HOME, ".claude", "projects")
+PLIST = os.path.join(HOME, "Library", "LaunchAgents", "dev.claudesessions.snapshot.plist")
+KEEP_HISTORY = 30
+DEFAULT_KEEP_HOURS = 72
+
+WARNINGS = []
+
+
+def warn(msg):
+    WARNINGS.append(msg)
+    print("warning: " + msg, file=sys.stderr)
+
+
+def sh(cmd, timeout=15):
     try:
-        with open(f, encoding='utf-8', errors='replace') as fh:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def osa(script, timeout=30):
+    try:
+        p = subprocess.run(["osascript", "-"], input=script, capture_output=True,
+                           text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def app_running(name):
+    rc, out, _ = osa('tell application "System Events" to return (name of processes) contains "%s"' % name)
+    return rc == 0 and out.strip() == "true"
+
+
+# ---------------------------------------------------------------- discovery
+
+def parse_etime(s):
+    """[[dd-]hh:]mm:ss  ->  seconds. Locale-independent, unlike lstart."""
+    s = s.strip()
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        days = int(d)
+    parts = [int(x) for x in s.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, sec = parts[-3], parts[-2], parts[-1]
+    return days * 86400 + h * 3600 + m * 60 + sec
+
+
+HEADLESS = re.compile(r'(^|\s)(-p|--print)(\s|$)')
+
+
+def is_claude_cli(cmd):
+    """True for a real Claude Code CLI process, false for MCP servers, hooks, editors."""
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        argv = cmd.split()
+    if not argv:
+        return False
+    exe = os.path.basename(argv[0])
+    if exe == "claude":
+        return True
+    # older installs / npx run it as node .../cli.js
+    if exe in ("node", "bun", "deno") and len(argv) > 1:
+        joined = " ".join(argv[1:3])
+        if "claude-code" in joined or joined.rstrip().endswith("cli.js") and "claude" in joined:
+            return True
+    return False
+
+
+def discover():
+    """Every interactive Claude Code window: pid, ppid, cwd, tty, start time, resumed id."""
+    rc, out, _ = sh(["ps", "-axo", "pid=,ppid=,etime=,tty=,command="])
+    if rc != 0:
+        warn("ps failed; cannot see any windows")
+        return []
+    now = time.time()
+    cand = {}
+    for line in out.splitlines():
+        m = re.match(r'\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$', line)
+        if not m:
+            continue
+        pid, ppid, etime, tty, cmd = int(m.group(1)), int(m.group(2)), m.group(3), m.group(4), m.group(5)
+        if not is_claude_cli(cmd):
+            continue
+        if HEADLESS.search(cmd):
+            continue          # `claude -p ...` from a hook, not a window
+        if tty in ("??", "?", "-"):
+            continue          # no terminal => not a window
+        cand[pid] = {"pid": pid, "ppid": ppid, "tty": "/dev/" + tty,
+                     "start": now - parse_etime(etime), "cmd": cmd}
+    # a Claude window forks helper `claude` children that inherit its cwd and tty;
+    # keep only the topmost of each family, or the count per directory doubles.
+    wins = [w for w in cand.values() if w["ppid"] not in cand]
+    for w in wins:
+        rm = re.search(r'(?:--resume|-r)\s+([0-9a-fA-F-]{36})', w["cmd"])
+        w["resumed"] = rm.group(1) if rm else None
+        w["cwd"] = pid_cwd(w["pid"])
+        if not w["cwd"]:
+            warn("could not read the working directory of pid %d (%s) — it will be missing "
+                 "from the snapshot" % (w["pid"], w["cmd"][:60]))
+    return [w for w in wins if w["cwd"]]
+
+
+def pid_cwd(pid, tries=3):
+    for i in range(tries):
+        rc, out, _ = sh(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], timeout=20)
+        for line in out.splitlines():
+            if line.startswith("n"):
+                return line[1:].strip()
+        time.sleep(0.2 * (i + 1))
+    return None
+
+
+# ---------------------------------------------------------------- geometry
+
+GEOM_AS = '''
+tell application "%s"
+  set out to ""
+  repeat with w in windows
+    try
+      set b to bounds of w
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          set out to out & (tty of s) & "\t" & (item 1 of b) & "\t" & (item 2 of b) & "\t" & (item 3 of b) & "\t" & (item 4 of b) & linefeed
+        end repeat
+      end repeat
+    end try
+  end repeat
+  return out
+end tell
+'''
+
+GEOM_TERMINAL = '''
+tell application "Terminal"
+  set out to ""
+  repeat with w in windows
+    try
+      set b to bounds of w
+      repeat with t in tabs of w
+        set out to out & (tty of t) & "\t" & (item 1 of b) & "\t" & (item 2 of b) & "\t" & (item 3 of b) & "\t" & (item 4 of b) & linefeed
+      end repeat
+    end try
+  end repeat
+  return out
+end tell
+'''
+
+
+def terminal_app():
+    if app_running("iTerm2"):
+        return "iTerm2"
+    if app_running("Terminal"):
+        return "Terminal"
+    return None
+
+
+def geometry():
+    """tty -> {'term': app, 'bounds': [l, t, r, b]}"""
+    g = {}
+    for app, script in (("iTerm2", GEOM_AS % "iTerm2"), ("Terminal", GEOM_TERMINAL)):
+        if not app_running(app):
+            continue
+        rc, out, err = osa(script)
+        if rc != 0:
+            warn("could not read %s window positions (%s)" % (app, err[:80]))
+            continue
+        for line in out.splitlines():
+            f = line.split("\t")
+            if len(f) == 5:
+                try:
+                    g[f[0].strip()] = {"term": app, "bounds": [int(x) for x in f[1:]]}
+                except ValueError:
+                    pass
+    return g
+
+
+# ---------------------------------------------------------------- transcripts
+
+def enc(path):
+    return re.sub(r'[/.]', '-', path)
+
+
+def project_dir(cwd):
+    d = os.path.join(PROJ, enc(cwd))
+    return d if os.path.isdir(d) else None
+
+
+def transcripts(cwd):
+    d = project_dir(cwd)
+    if not d:
+        return []
+    out = []
+    for f in glob.glob(os.path.join(d, "*.jsonl")):
+        try:
+            st = os.stat(f)
+        except OSError:
+            continue
+        out.append({"file": f, "id": os.path.basename(f)[:-6],
+                    "born": getattr(st, "st_birthtime", st.st_ctime), "mtime": st.st_mtime})
+    return out
+
+
+def title(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                try: d = json.loads(line)
-                except Exception: continue
-                if d.get('type') == 'user':
-                    m = d.get('message', {})
-                    c = m.get('content')
-                    if isinstance(c, list):
-                        c = ' '.join(x.get('text','') for x in c if isinstance(x, dict))
-                    if isinstance(c, str) and c.strip() and not c.startswith('<'):
-                        return ' '.join(c.split())[:90]
-    except Exception: pass
-    return ''
-out = []
-for cwd, n in sorted(collections.Counter(cwds).items()):
-    d = os.path.join(proj, enc(cwd))
-    files = sorted(glob.glob(os.path.join(d, '*.jsonl')),
-                   key=os.path.getmtime, reverse=True)[:n]
-    if not files:
-        out.append({"cwd": cwd, "session": None, "title": "(no transcript found)"})
-        continue
-    for f in files:
-        out.append({"cwd": cwd,
-                    "session": os.path.basename(f)[:-6],
-                    "mtime": int(os.path.getmtime(f)),
-                    "title": title(f)})
-out.sort(key=lambda r: (-(r.get('mtime') or 0)))
-os.makedirs(os.path.dirname(state), exist_ok=True)
-json.dump({"saved": out}, open(state, 'w'), indent=2)
-print(f"saved {len(out)} session(s) -> {state}")
-PY
-  rm -f "$tmp"
-}
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") != "user" or d.get("isSidechain"):
+                    continue
+                c = d.get("message", {}).get("content")
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                if isinstance(c, str) and c.strip() and not c.startswith("<"):
+                    return " ".join(c.split())[:90]
+    except Exception:
+        pass
+    return ""
 
-list_() {
-  [ -f "$STATE" ] || { echo "no snapshot yet — run: claude-sessions save"; exit 1; }
-  python3 - "$STATE" <<'PY'
-import json,sys
-d=json.load(open(sys.argv[1]))["saved"]
-print(f"{len(d)} session(s):")
-for r in d:
-    print(f"  {r['cwd']}")
-    print(f"     {r['session'] or '-'}  {r.get('title','')[:76]}")
-PY
-}
 
-restore() {
-  [ -f "$STATE" ] || { echo "no snapshot — run: claude-sessions save"; exit 1; }
-  local mode="${1:-windows}"
-  if [ "$mode" = "--dry-run" ]; then
-    python3 - "$STATE" <<'PY2'
-import json,shlex,sys
-for r in json.load(open(sys.argv[1]))["saved"]:
-    c=f"cd {shlex.quote(r['cwd'])} && claude"
-    if r.get("session"): c+=f" --resume {r['session']}"
-    print("  "+c)
-PY2
-    exit 0
-  fi
-  local term="Terminal"
-  osascript -e 'tell application "System Events" to (name of processes) contains "iTerm2"' 2>/dev/null | grep -q true && term="iTerm2"
-  echo "reopening via $term ..."
-  python3 - "$STATE" "$term" "$mode" <<'PY'
-import json, subprocess, sys, shlex
-rows = json.load(open(sys.argv[1]))["saved"]
-term, mode = sys.argv[2], sys.argv[3]
-def cmd(r):
-    c = f"cd {shlex.quote(r['cwd'])} && claude"
-    if r.get("session"): c += f" --resume {r['session']}"
+def match_sessions(windows):
+    """Give every window a session id, and say how sure we are.
+
+    resume    exact — the id is on the process command line
+    start     strong — the transcript was created just after the process started
+    mtime     guess — most recently written unclaimed transcript in that directory
+    """
+    by_cwd = {}
+    for w in windows:
+        by_cwd.setdefault(w["cwd"], []).append(w)
+
+    rows = []
+    for cwd, wins in by_cwd.items():
+        pool = transcripts(cwd)
+        claimed = set()
+
+        for w in wins:                                    # pass 1: exact
+            if w["resumed"] and any(t["id"] == w["resumed"] for t in pool):
+                w["session"], w["match"] = w["resumed"], "resume"
+                claimed.add(w["resumed"])
+
+        for w in wins:                                    # pass 2: birth time
+            if w.get("session"):
+                continue
+            best, best_gap = None, None
+            for t in pool:
+                if t["id"] in claimed:
+                    continue
+                gap = t["born"] - w["start"]
+                if -30 <= gap <= 900 and (best_gap is None or gap < best_gap):
+                    best, best_gap = t, gap
+            if best:
+                w["session"], w["match"] = best["id"], "start"
+                claimed.add(best["id"])
+
+        for w in wins:                                    # pass 3: fallback
+            if w.get("session"):
+                continue
+            # a transcript that already existed before this process started cannot be
+            # its conversation — unless it was resumed, and pass 1 caught those. Without
+            # this the fallback happily hands a window someone else's session, including
+            # the transcripts that headless `claude -p` hook runs leave in the same
+            # directory.
+            left = sorted([t for t in pool
+                           if t["id"] not in claimed and t["born"] >= w["start"] - 30],
+                          key=lambda t: t["mtime"], reverse=True)
+            if left:
+                w["session"], w["match"] = left[0]["id"], "mtime"
+                claimed.add(left[0]["id"])
+            else:
+                w["session"], w["match"] = None, "fresh"
+        rows.extend(wins)
+    return rows
+
+
+# ---------------------------------------------------------------- snapshot io
+
+def load(path=STATE):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+    except Exception as e:
+        warn("snapshot at %s is unreadable (%s)" % (path, e))
+        return None
+    d.setdefault("saved", [])
+    return d
+
+
+def write_snapshot(rows, path=STATE):
+    doc = {"version": 2, "saved_at": int(time.time()), "saved": rows}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(doc, fh, indent=2)
+    os.replace(tmp, path)
+    if path == STATE:
+        os.makedirs(HISTDIR, exist_ok=True)
+        hp = os.path.join(HISTDIR, "%d.json" % doc["saved_at"])
+        with open(hp, "w") as fh:
+            json.dump(doc, fh, indent=2)
+        old = sorted(glob.glob(os.path.join(HISTDIR, "*.json")))[:-KEEP_HISTORY]
+        for f in old:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+    return doc
+
+
+def history():
+    return sorted(glob.glob(os.path.join(HISTDIR, "*.json")), reverse=True)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_save(args):
+    wins = match_sessions(discover())
+    if not wins and not args.replace:
+        print("no running claude windows — leaving the existing snapshot alone")
+        return 0
+    geo = geometry()
+    now = int(time.time())
+    rows = []
+    for w in wins:
+        g = geo.get(w["tty"], {})
+        f = os.path.join(PROJ, enc(w["cwd"]), (w["session"] or "") + ".jsonl")
+        rows.append({
+            "cwd": w["cwd"],
+            "session": w["session"],
+            "title": title(f) if w["session"] and os.path.exists(f) else "",
+            "match": w["match"],
+            "tty": w["tty"],
+            "term": g.get("term"),
+            "bounds": g.get("bounds"),
+            "last_seen": now,
+            "live": True,
+        })
+
+    kept = 0
+    if not args.replace:
+        prev = load()
+        have = {r["session"] for r in rows if r["session"]}
+        cutoff = now - args.keep_hours * 3600
+        for r in (prev or {}).get("saved", []):
+            sid = r.get("session")
+            if not sid or sid in have:
+                continue
+            if r.get("last_seen", 0) < cutoff:
+                continue
+            if not os.path.exists(os.path.join(PROJ, enc(r["cwd"]), sid + ".jsonl")):
+                continue
+            r = dict(r)
+            r["live"] = False
+            rows.append(r)
+            kept += 1
+
+    rows.sort(key=lambda r: (not r.get("live"), -(r.get("last_seen") or 0)))
+    write_snapshot(rows)
+    exact = sum(1 for r in rows if r.get("match") in ("resume", "start"))
+    guess = sum(1 for r in rows if r.get("match") == "mtime")
+    fresh = sum(1 for r in rows if r.get("match") == "fresh")
+    bits = ["%d exactly identified" % exact]
+    if guess:
+        bits.append("%d by best guess" % guess)
+    if fresh:
+        bits.append("%d with no conversation yet" % fresh)
+    print("saved %d window(s) -> %s" % (len(rows), STATE))
+    print("  %d open now (%s)%s"
+          % (len(wins), ", ".join(bits),
+             ", %d remembered from a previous snapshot" % kept if kept else ""))
+    if not geo:
+        print("  (no window positions captured — is iTerm2 or Terminal running?)")
+    return 0
+
+
+def cmd_list(args):
+    if args.history:
+        h = history()
+        if not h:
+            print("no snapshot history yet")
+            return 1
+        print("%d snapshot(s), newest first:" % len(h))
+        for i, f in enumerate(h):
+            d = load(f) or {"saved": []}
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(d.get("saved_at", 0)))
+            live = sum(1 for r in d["saved"] if r.get("live"))
+            print("  [%d] %s  %d window(s) (%d open at the time)  %s"
+                  % (i, ts, len(d["saved"]), live, os.path.basename(f)))
+        return 0
+    d = load(args.source or STATE)
+    if not d:
+        print("no snapshot yet — run: claude-sessions save")
+        return 1
+    rows = d["saved"]
+    ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(d.get("saved_at", 0)))
+    print("%d window(s), snapshot taken %s:" % (len(rows), ts))
+    running = {(w["cwd"], w.get("session")) for w in match_sessions(discover())}
+    for r in rows:
+        flags = []
+        if (r["cwd"], r.get("session")) in running:
+            flags.append("open now")
+        elif not r.get("live"):
+            flags.append("remembered")
+        if r.get("match") == "mtime":
+            flags.append("id is a guess")
+        if not r.get("bounds"):
+            flags.append("no position")
+        print("  %s%s" % (r["cwd"], "   [" + ", ".join(flags) + "]" if flags else ""))
+        print("     %s  %s" % ((r.get("session") or "-")[:8], (r.get("title") or "")[:72]))
+    return 0
+
+
+def build_cmd(r):
+    c = "cd %s && claude" % shlex.quote(r["cwd"])
+    if r.get("session"):
+        c += " --resume %s" % r["session"]
     return c
-for i, r in enumerate(rows):
-    c = cmd(r).replace('\\', '\\\\').replace('"', '\\"')
-    if term == "iTerm2":
-        if mode == "--tabs" and i:
-            s = f'tell application "iTerm2" to tell current window to tell (create tab with default profile) to tell current session to write text "{c}"'
+
+
+def layout_rects(rows, mode, cols=None, rect=None):
+    """Return a bounds list, one per row, or None to leave a window where it lands."""
+    n = len(rows)
+    if n == 0:
+        return []
+    if mode == "saved":
+        return [r.get("bounds") for r in rows]
+    if mode == "none":
+        return [None] * n
+    if rect is None:
+        boxes = [r.get("bounds") for r in rows if r.get("bounds")]
+        if boxes:
+            rect = [min(b[0] for b in boxes), min(b[1] for b in boxes),
+                    max(b[2] for b in boxes), max(b[3] for b in boxes)]
         else:
-            s = f'tell application "iTerm2" to tell (create window with default profile) to tell current session to write text "{c}"'
+            rc, out, _ = osa('tell application "Finder" to get bounds of window of desktop')
+            try:
+                rect = [int(x) for x in out.split(",")]
+            except Exception:
+                rect = [0, 0, 1440, 900]
+    l, t, r_, b = rect
+    if mode == "cascade":
+        w, h = int((r_ - l) * 0.55), int((b - t) * 0.6)
+        step = 34
+        return [[l + (i * step) % max(1, (r_ - l - w)),
+                 t + (i * step) % max(1, (b - t - h)),
+                 l + (i * step) % max(1, (r_ - l - w)) + w,
+                 t + (i * step) % max(1, (b - t - h)) + h] for i in range(n)]
+    c = cols or max(1, math.ceil(math.sqrt(n)))
+    rws = max(1, math.ceil(n / c))
+    cw, ch = (r_ - l) // c, (b - t) // rws
+    gap = 4
+    out = []
+    for i in range(n):
+        cx, cy = i % c, i // c
+        out.append([l + cx * cw + gap, t + cy * ch + gap,
+                    l + (cx + 1) * cw - gap, t + (cy + 1) * ch - gap])
+    return out
+
+
+NEW_WINDOW_ITERM = '''
+tell application "iTerm2"
+  set w to (create window with default profile)
+  tell current session of w to write text %s
+  %s
+  return tty of current session of w
+end tell
+'''
+
+NEW_TAB_ITERM = '''
+tell application "iTerm2"
+  tell current window
+    set s to (create tab with default profile)
+    tell current session of s to write text %s
+  end tell
+  return "tab"
+end tell
+'''
+
+NEW_WINDOW_TERMINAL = '''
+tell application "Terminal"
+  set t to do script %s
+  set w to first window whose tabs contains t
+  %s
+  return tty of t
+end tell
+'''
+
+
+def as_str(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def open_window(term, command, bounds, tabs=False):
+    setb = ""
+    if bounds:
+        # A window that was just created is still being placed by the terminal, so a
+        # single `set bounds` gets the size but not the origin. Let it settle, then
+        # apply twice — the second one sticks.
+        b = "set bounds of w to {%d, %d, %d, %d}" % tuple(bounds)
+        setb = "delay 0.25\n  %s\n  delay 0.15\n  %s" % (b, b)
+    if term == "iTerm2":
+        script = NEW_TAB_ITERM % as_str(command) if tabs else NEW_WINDOW_ITERM % (as_str(command), setb)
     else:
-        s = f'tell application "Terminal" to do script "{c}"'
-    subprocess.run(["osascript", "-e", s], check=False)
-print(f"reopened {len(rows)} window(s)")
-PY
-}
+        setb = setb.replace("of w", "of w")
+        script = NEW_WINDOW_TERMINAL % (as_str(command), setb)
+    for attempt in range(3):
+        rc, out, err = osa(script, timeout=45)
+        if rc == 0 and out:
+            return True, out
+        time.sleep(0.6 * (attempt + 1))
+    return False, err
 
-PLIST="$HOME/Library/LaunchAgents/dev.claudesessions.snapshot.plist"
 
-install_auto() {
-  local self; self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-  mkdir -p "$(dirname "$PLIST")"
-  cat > "$PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
+def cmd_restore(args):
+    src = args.source
+    if src and src.isdigit():
+        h = history()
+        i = int(src)
+        if i >= len(h):
+            print("no snapshot [%s] in history" % src)
+            return 1
+        src = h[i]
+    d = load(src or STATE)
+    if not d:
+        print("no snapshot — run: claude-sessions save")
+        return 1
+    rows = [r for r in d["saved"] if r.get("session")]
+
+    running = {(w["cwd"], w.get("session")) for w in match_sessions(discover())}
+    skipped = [r for r in rows if (r["cwd"], r["session"]) in running]
+    if not args.force:
+        rows = [r for r in rows if (r["cwd"], r["session"]) not in running]
+
+    if not rows:
+        print("nothing to reopen — all %d window(s) in the snapshot are already open" % len(skipped))
+        return 0
+
+    rects = layout_rects(rows, args.layout, cols=args.cols, rect=args.rect)
+
+    if args.dry_run:
+        print("would reopen %d window(s)%s:"
+              % (len(rows), " (%d already open, skipped)" % len(skipped) if skipped else ""))
+        for r, bb in zip(rows, rects):
+            print("  %s%s" % (build_cmd(r), ("   @ %s" % bb) if bb else ""))
+        return 0
+
+    term = terminal_app()
+    if not term:
+        print("neither iTerm2 nor Terminal is running — start one first")
+        return 1
+    print("reopening %d window(s) via %s%s ..."
+          % (len(rows), term, " (%d already open, skipped)" % len(skipped) if skipped else ""))
+
+    ok, failed = 0, []
+    for i, (r, bb) in enumerate(zip(rows, rects)):
+        good, out = open_window(term, build_cmd(r), bb, tabs=args.tabs and i > 0)
+        if good:
+            ok += 1
+        else:
+            failed.append((r, out))
+        time.sleep(args.pace)
+
+    print("reopened %d of %d window(s)" % (ok, len(rows)))
+    if failed:
+        print("FAILED to reopen %d — rerun to retry just these:" % len(failed))
+        for r, err in failed:
+            print("  %s" % build_cmd(r))
+            if err:
+                print("      %s" % err[:120])
+        return 1
+    return 0
+
+
+MOVE_ITERM = """
+tell application "iTerm2"
+  repeat with w in windows
+    try
+      if (tty of first session of first tab of w) is "%s" then
+        set bounds of w to {%d, %d, %d, %d}
+        delay 0.15
+        set bounds of w to {%d, %d, %d, %d}
+        return "ok"
+      end if
+    end try
+  end repeat
+  return ""
+end tell
+"""
+
+MOVE_TERMINAL = """
+tell application "Terminal"
+  repeat with w in windows
+    try
+      if (tty of first tab of w) is "%s" then
+        set bounds of w to {%d, %d, %d, %d}
+        delay 0.15
+        set bounds of w to {%d, %d, %d, %d}
+        return "ok"
+      end if
+    end try
+  end repeat
+  return ""
+end tell
+"""
+
+
+def move_script(app, tty, bounds):
+    tmpl = MOVE_ITERM if app == "iTerm2" else MOVE_TERMINAL
+    return tmpl % ((tty,) + tuple(bounds) + tuple(bounds))
+
+
+def cmd_arrange(args):
+    if getattr(args, "watch", False):
+        return arrange_watch(args)
+    return arrange_once(args)
+
+
+def arrange_watch(args):
+    """Re-tile whenever a Claude window opens or closes — and only then, so that a
+    window you drag somewhere on purpose is left where you put it."""
+    print("watching for windows opening and closing (every %ds); ctrl-c to stop" % args.every)
+    last = None
+    while True:
+        sig = tuple(sorted(w["tty"] for w in discover()))
+        if sig != last:
+            if sig:
+                arrange_once(args)
+            last = sig
+        try:
+            time.sleep(args.every)
+        except KeyboardInterrupt:
+            return 0
+
+
+def arrange_once(args):
+    wins = match_sessions(discover())
+    if not wins:
+        print("no running claude windows")
+        return 0
+    geo = geometry()
+    term = terminal_app()
+    if not term:
+        print("neither iTerm2 nor Terminal is running")
+        return 1
+
+    if args.mode == "saved":
+        d = load()
+        if not d:
+            print("no snapshot to take positions from")
+            return 1
+        pos = {r["session"]: r.get("bounds") for r in d["saved"] if r.get("bounds")}
+        rows = [{"bounds": pos.get(w.get("session"))} for w in wins]
+        rects = [r["bounds"] for r in rows]
+    else:
+        for w in wins:
+            w["bounds"] = geo.get(w["tty"], {}).get("bounds")
+        if args.busy_first:
+            # a session being written to right now is one you are waiting on, so give
+            # it the first cell of the grid
+            def activity(w):
+                f = os.path.join(PROJ, enc(w["cwd"]), (w.get("session") or "") + ".jsonl")
+                try:
+                    return -os.path.getmtime(f)
+                except OSError:
+                    return 0
+            wins.sort(key=activity)
+        else:
+            wins.sort(key=lambda w: (w["cwd"], w.get("session") or ""))
+        rects = layout_rects(wins, args.mode, cols=args.cols, rect=args.rect)
+
+    moved = 0
+    for w, bb in zip(wins, rects):
+        if not bb:
+            continue
+        app = geo.get(w["tty"], {}).get("term", term)
+        s = move_script(app, w["tty"], bb)
+        if args.dry_run:
+            print("  %s  ->  %s" % (w["cwd"], bb))
+            moved += 1
+            continue
+        rc, out, err = osa(s)
+        if rc == 0 and out == "ok":
+            moved += 1
+        else:
+            warn("could not move the window for %s (%s)"
+                 % (w["cwd"], (err or "no terminal window on " + w["tty"])[:80]))
+    print("%s %d of %d window(s) [%s]"
+          % ("would arrange" if args.dry_run else "arranged", moved, len(wins), args.mode))
+    return 0
+
+
+def cmd_doctor(args):
+    wins = match_sessions(discover())
+    geo = geometry()
+    print("terminal: %s" % (terminal_app() or "none running"))
+    print("snapshot: %s%s" % (STATE, "" if os.path.exists(STATE) else "  (does not exist yet)"))
+    print("history:  %d snapshot(s) in %s" % (len(history()), HISTDIR))
+    print("%d Claude Code window(s) visible:" % len(wins))
+    for w in wins:
+        g = geo.get(w["tty"], {})
+        print("  pid %-6d %-10s %-42s %s  %s"
+              % (w["pid"], w["tty"].replace("/dev/", ""), w["cwd"],
+                 (w.get("session") or "-")[:8], w.get("match")))
+        if not g:
+            print("         no window position — this window will come back unpositioned")
+    guessed = [w for w in wins if w.get("match") == "mtime"]
+    if guessed:
+        print("\n%d window(s) matched only by 'most recently written transcript'. Those can come"
+              "\nback on the wrong conversation. They become exact once restored (the session id"
+              "\nthen sits on the command line)." % len(guessed))
+    if WARNINGS:
+        print("\n%d warning(s) above." % len(WARNINGS))
+    return 0
+
+
+PLIST_TMPL = '''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>dev.claudesessions.snapshot</string>
   <key>ProgramArguments</key>
-  <array><string>/bin/bash</string><string>$self</string><string>save</string></array>
-  <key>StartInterval</key><integer>${1:-600}</integer>
+  <array><string>%s</string><string>save</string></array>
+  <key>StartInterval</key><integer>%d</integer>
   <key>RunAtLoad</key><false/>
   <key>StandardErrorPath</key><string>/tmp/claude-sessions.err</string>
 </dict></plist>
-EOF
-  launchctl unload "$PLIST" 2>/dev/null
-  launchctl load "$PLIST" 2>/dev/null
-  echo "auto-save installed: every ${1:-600}s -> $STATE"
-  echo "  (snapshots only while at least one claude window is open)"
-}
+'''
 
-uninstall_auto() {
-  launchctl unload "$PLIST" 2>/dev/null
-  rm -f "$PLIST"
-  echo "auto-save removed"
-}
 
-case "${1:-}" in
-  save) save ;;
-  install-auto) shift; install_auto "${1:-600}" ;;
-  uninstall-auto) uninstall_auto ;;
-  list) list_ ;;
-  restore) shift; restore "${1:-windows}" ;;
-  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
-esac
+def cmd_install_auto(args):
+    self = os.path.realpath(__file__)
+    os.makedirs(os.path.dirname(PLIST), exist_ok=True)
+    with open(PLIST, "w") as fh:
+        fh.write(PLIST_TMPL % (self, args.seconds))
+    sh(["launchctl", "unload", PLIST])
+    rc, _, err = sh(["launchctl", "load", PLIST])
+    if rc != 0:
+        print("launchctl load failed: %s" % err.strip())
+        return 1
+    print("auto-save installed: every %ds -> %s" % (args.seconds, STATE))
+    print("  it merges, so a window that fails to reopen is not forgotten")
+    return 0
+
+
+ARRANGE_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "dev.claudesessions.arrange.plist")
+
+ARRANGE_TMPL = '''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.claudesessions.arrange</string>
+  <key>ProgramArguments</key>
+  <array>%s</array>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>/tmp/claude-sessions-arrange.err</string>
+</dict></plist>
+'''
+
+
+def cmd_install_arrange(args):
+    self = os.path.realpath(__file__)
+    argv = [self, "arrange", args.mode, "--watch", "--every", str(args.every)]
+    if args.cols:
+        argv += ["--cols", str(args.cols)]
+    if args.rect:
+        argv += ["--rect", ",".join(str(x) for x in args.rect)]
+    if args.busy_first:
+        argv.append("--busy-first")
+    body = "".join("<string>%s</string>" % a for a in argv)
+    os.makedirs(os.path.dirname(ARRANGE_PLIST), exist_ok=True)
+    with open(ARRANGE_PLIST, "w") as fh:
+        fh.write(ARRANGE_TMPL % body)
+    sh(["launchctl", "unload", ARRANGE_PLIST])
+    rc, _, err = sh(["launchctl", "load", ARRANGE_PLIST])
+    if rc != 0:
+        print("launchctl load failed: %s" % err.strip())
+        return 1
+    print("auto-arrange installed: %s layout, applied whenever a window opens or closes"
+          % args.mode)
+    print("  windows you move by hand stay put until the next open or close")
+    return 0
+
+
+def cmd_uninstall_arrange(args):
+    sh(["launchctl", "unload", ARRANGE_PLIST])
+    if os.path.exists(ARRANGE_PLIST):
+        os.remove(ARRANGE_PLIST)
+    print("auto-arrange removed")
+    return 0
+
+
+def cmd_uninstall_auto(args):
+    sh(["launchctl", "unload", PLIST])
+    if os.path.exists(PLIST):
+        os.remove(PLIST)
+    print("auto-save removed")
+    return 0
+
+
+def rect_arg(s):
+    v = [int(x) for x in s.split(",")]
+    if len(v) != 4:
+        raise argparse.ArgumentTypeError("expected left,top,right,bottom")
+    return v
+
+
+def main():
+    p = argparse.ArgumentParser(prog="claude-sessions", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("save", help="snapshot the open windows")
+    s.add_argument("--replace", action="store_true",
+                   help="record only what is open now, forgetting everything else")
+    s.add_argument("--keep-hours", type=int, default=DEFAULT_KEEP_HOURS,
+                   help="how long to remember a window that is no longer open (default %d)" % DEFAULT_KEEP_HOURS)
+    s.set_defaults(fn=cmd_save)
+
+    s = sub.add_parser("list", help="show the snapshot")
+    s.add_argument("--history", action="store_true")
+    s.add_argument("--source")
+    s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("restore", help="reopen the windows that are missing")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--tabs", action="store_true", help="reopen as tabs in one window")
+    s.add_argument("--layout", choices=["saved", "grid", "cascade", "none"], default="saved")
+    s.add_argument("--cols", type=int)
+    s.add_argument("--rect", type=rect_arg, help="left,top,right,bottom to lay out inside")
+    s.add_argument("--force", action="store_true", help="reopen even what is already open")
+    s.add_argument("--pace", type=float, default=0.5, help="seconds between windows")
+    s.add_argument("--source", help="snapshot file, or an index from `list --history`")
+    s.set_defaults(fn=cmd_restore)
+
+    s = sub.add_parser("arrange", help="retile the windows that are open now")
+    s.add_argument("mode", nargs="?", choices=["grid", "cascade", "saved"], default="grid")
+    s.add_argument("--cols", type=int)
+    s.add_argument("--rect", type=rect_arg)
+    s.add_argument("--busy-first", action="store_true",
+                   help="put the sessions that are working right now in the first cells")
+    s.add_argument("--watch", action="store_true",
+                   help="keep running, re-tiling when a window opens or closes")
+    s.add_argument("--every", type=int, default=10, help="seconds between checks when watching")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_arrange)
+
+    s = sub.add_parser("install-arrange", help="auto-arrange windows as they open and close")
+    s.add_argument("mode", nargs="?", choices=["grid", "cascade", "saved"], default="grid")
+    s.add_argument("--cols", type=int)
+    s.add_argument("--rect", type=rect_arg)
+    s.add_argument("--busy-first", action="store_true")
+    s.add_argument("--every", type=int, default=10)
+    s.set_defaults(fn=cmd_install_arrange)
+
+    s = sub.add_parser("uninstall-arrange")
+    s.set_defaults(fn=cmd_uninstall_arrange)
+
+    s = sub.add_parser("doctor", help="show what it can and cannot see")
+    s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("install-auto", help="periodic snapshot via launchd")
+    s.add_argument("seconds", nargs="?", type=int, default=600)
+    s.set_defaults(fn=cmd_install_auto)
+
+    s = sub.add_parser("uninstall-auto")
+    s.set_defaults(fn=cmd_uninstall_auto)
+
+    a = p.parse_args()
+    if not a.cmd:
+        p.print_help()
+        return 0
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
