@@ -598,7 +598,8 @@ def cmd_restore(args):
     if not d:
         print("no snapshot — run: claude-sessions save")
         return 1
-    rows = [r for r in d["saved"] if r.get("session")]
+    # a window with no conversation yet still deserves to come back, as an empty one
+    rows = [r for r in d["saved"] if r.get("cwd")]
     archived = [r for r in rows if r.get("archived")]
     if archived and not args.include_archived:
         rows = [r for r in rows if not r.get("archived")]
@@ -804,6 +805,47 @@ def tail_user(path, window=196608):
     return text, last_ts
 
 
+USER_HINT = b'"type":"user"'
+
+
+def thread(path, cap=80, chars=260):
+    """Every prompt you typed in a conversation — the thing worth drilling into.
+
+    The transcripts run to tens of megabytes, so only lines that could possibly
+    be a user message are handed to the JSON parser.
+    """
+    msgs = []
+    try:
+        with open(path, "rb") as fh:
+            for raw in fh:
+                if USER_HINT not in raw:
+                    continue
+                try:
+                    d = json.loads(raw.decode("utf-8", "replace"))
+                except Exception:
+                    continue
+                if d.get("type") != "user" or d.get("isSidechain"):
+                    continue
+                c = d.get("message", {}).get("content")
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                if not isinstance(c, str):
+                    continue
+                c = " ".join(c.split())
+                if not c or c.startswith("<") or c.startswith("Base directory for this skill:"):
+                    continue          # tool results and skill preambles, not you talking
+                msgs.append({"t": d.get("timestamp"), "m": c[:chars]})
+    except OSError:
+        pass
+    if len(msgs) > cap:
+        head_n = cap // 2
+        elided = len(msgs) - cap
+        msgs = (msgs[:head_n]
+                + [{"t": None, "m": "… %d more prompts …" % elided, "gap": True}]
+                + msgs[-(cap - head_n):])
+    return msgs
+
+
 def scan_library(days=None, deep=False):
     """Every real conversation on disk, newest first, with enough to recognise it."""
     cutoff = time.time() - days * 86400 if days else 0
@@ -836,52 +878,65 @@ def scan_library(days=None, deep=False):
         if not first:
             first = title(f)[:200]
         last, last_ts = tail_user(f)
-        rows.append({"cwd": cwd, "branch": branch or "", "session": os.path.basename(f)[:-6],
-                     "first": first, "last": last, "started": started,
-                     "ended": last_ts or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime)),
-                     "mtime": int(st.st_mtime), "bytes": st.st_size})
+        row = {"cwd": cwd, "branch": branch or "", "session": os.path.basename(f)[:-6],
+               "first": first, "last": last, "started": started,
+               "ended": last_ts or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime)),
+               "mtime": int(st.st_mtime), "bytes": st.st_size}
+        if deep:
+            row["thread"] = thread(f)
+            row["n"] = sum(1 for m in row["thread"] if not m.get("gap"))
+            if row["thread"]:
+                row["first"] = row["thread"][0]["m"][:200] or row["first"]
+                row["last"] = row["thread"][-1]["m"][:280]
+        rows.append(row)
     rows.sort(key=lambda r: -r["mtime"])
     return rows
 
 
-PAGE = """<title>Claude Code sessions</title>
+PAGE = r"""<title>Claude Code sessions</title>
 <style>
   :root {
     --bg:#faf9f7; --panel:#fff; --ink:#1d1b17; --muted:#6d675e; --line:#e6e2db;
-    --accent:#a8562a; --chip:#f1ede6; --open:#2f7d4f; --arch:#8a7f70;
+    --accent:#a8562a; --chip:#f1ede6; --open:#2f7d4f; --arch:#8a7f70; --mark:#ffe6a8;
   }
-  :root:not([data-theme=light]) { }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme=light]) {
       --bg:#14130f; --panel:#1c1a16; --ink:#eeeae2; --muted:#9c9486; --line:#2e2a24;
-      --accent:#e08a55; --chip:#26231d; --open:#6fc48d; --arch:#7d7466;
+      --accent:#e08a55; --chip:#26231d; --open:#6fc48d; --arch:#7d7466; --mark:#5a4520;
     }
   }
   :root[data-theme=dark] {
     --bg:#14130f; --panel:#1c1a16; --ink:#eeeae2; --muted:#9c9486; --line:#2e2a24;
-    --accent:#e08a55; --chip:#26231d; --open:#6fc48d; --arch:#7d7466;
+    --accent:#e08a55; --chip:#26231d; --open:#6fc48d; --arch:#7d7466; --mark:#5a4520;
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--ink);
-    font:15px/1.5 ui-sans-serif,-apple-system,"SF Pro Text",Segoe UI,sans-serif; }
+    font:15px/1.55 ui-sans-serif,-apple-system,"SF Pro Text",Segoe UI,sans-serif; }
   header { position:sticky; top:0; background:var(--bg); border-bottom:1px solid var(--line);
-    padding:18px 24px 14px; z-index:5; }
+    padding:16px 24px 12px; z-index:5; }
   h1 { margin:0 0 2px; font-size:19px; letter-spacing:-.01em; font-weight:650; }
   .sub { color:var(--muted); font-size:13px; }
-  .controls { display:flex; gap:10px; margin-top:12px; flex-wrap:wrap; }
+  .controls { display:flex; gap:10px; margin-top:11px; flex-wrap:wrap; align-items:center; }
   input[type=search], select { background:var(--panel); color:var(--ink); border:1px solid var(--line);
     border-radius:8px; padding:8px 11px; font:inherit; font-size:14px; }
   input[type=search] { flex:1; min-width:220px; }
-  main { padding:8px 24px 60px; max-width:1080px; }
-  .grp { margin-top:26px; }
-  .grp h2 { font-size:13px; font-weight:650; color:var(--muted); margin:0 0 8px;
+  .ghost { background:none; border:1px solid var(--line); color:var(--muted); border-radius:8px;
+    padding:8px 11px; font:inherit; font-size:13px; cursor:pointer; }
+  .ghost:hover { color:var(--ink); border-color:var(--accent); }
+  main { padding:6px 24px 80px; max-width:1080px; }
+  .grp { margin-top:24px; }
+  .grp h2 { font-size:12.5px; font-weight:650; color:var(--muted); margin:0 0 8px;
     letter-spacing:.02em; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:11px;
-    padding:13px 15px; margin-bottom:9px; }
-  .card .t { font-weight:600; margin-bottom:5px; }
-  .card .l { color:var(--muted); font-size:13.5px; }
-  .card .l b { color:var(--ink); font-weight:600; }
-  .meta { margin-top:9px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+  details.card { background:var(--panel); border:1px solid var(--line); border-radius:11px;
+    margin-bottom:9px; overflow:hidden; }
+  details.card[open] { border-color:var(--accent); }
+  summary { padding:13px 15px; cursor:pointer; list-style:none; }
+  summary::-webkit-details-marker { display:none; }
+  summary:hover .t { color:var(--accent); }
+  .t { font-weight:600; margin-bottom:4px; }
+  .l { color:var(--muted); font-size:13.5px; }
+  .l b { color:var(--ink); font-weight:600; }
+  .meta { margin-top:9px; display:flex; gap:7px; align-items:center; flex-wrap:wrap;
     font-size:12px; color:var(--muted); }
   .chip { background:var(--chip); border-radius:999px; padding:2px 9px; }
   .chip.open { color:var(--open); font-weight:600; }
@@ -890,24 +945,36 @@ PAGE = """<title>Claude Code sessions</title>
     border-radius:7px; padding:4px 10px; font:inherit; font-size:12px; cursor:pointer;
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   button.cmd:hover { border-color:var(--accent); }
+  .thread { border-top:1px solid var(--line); padding:6px 15px 14px; max-height:60vh; overflow:auto; }
+  .msg { display:grid; grid-template-columns:74px 1fr; gap:12px; padding:8px 0;
+    border-bottom:1px solid var(--line); }
+  .msg:last-child { border-bottom:none; }
+  .msg time { color:var(--muted); font-size:11.5px; padding-top:2px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .msg p { margin:0; font-size:13.5px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .msg.gap p { color:var(--muted); font-style:italic; }
+  .msg.hit { background:color-mix(in srgb, var(--mark) 28%, transparent); border-radius:6px; }
+  mark { background:var(--mark); color:inherit; border-radius:3px; padding:0 2px; }
   .empty { color:var(--muted); padding:40px 0; }
 </style>
 <header>
   <h1>Claude Code sessions</h1>
   <div class="sub" id="sub"></div>
   <div class="controls">
-    <input type="search" id="q" placeholder="search what you were doing, a directory, a branch…" autofocus>
+    <input type="search" id="q" placeholder="search everything you typed, a directory, a branch…" autofocus>
     <select id="state">
       <option value="">everything</option>
       <option value="open">open now</option>
       <option value="closed">closed</option>
       <option value="archived">archived</option>
+      <option value="remembered">remembered</option>
     </select>
     <select id="grp">
       <option value="cwd">group by directory</option>
       <option value="day">group by day</option>
       <option value="">no grouping</option>
     </select>
+    <button class="ghost" id="expand">expand all</button>
   </div>
 </header>
 <main id="out"></main>
@@ -918,16 +985,45 @@ const short = p => p.replace(new RegExp("^/Users/[^/]+/"), "~/");
 const when = t => { const d = new Date(t); return isNaN(d) ? "" :
   d.toLocaleDateString(undefined,{month:"short",day:"numeric"}) + " " +
   d.toLocaleTimeString(undefined,{hour:"2-digit",minute:"2-digit"}); };
+const clock = t => { const d = new Date(t); return isNaN(d) ? "" :
+  d.toLocaleTimeString(undefined,{hour:"2-digit",minute:"2-digit"}); };
+const span = r => {
+  const a = new Date(r.started), b = new Date(r.ended);
+  const m = Math.round((b - a) / 60000);
+  if (!(m > 0)) return "";
+  return m < 60 ? m + "m" : Math.floor(m/60) + "h " + (m%60) + "m";
+};
+for (const r of DATA)
+  r._hay = [r.cwd, r.branch, r.first, r.last,
+            ...(r.thread || []).map(m => m.m)].join(" ").toLowerCase();
+
+let query = "";
+const hl = s => {
+  const e = esc(s);
+  if (!query) return e;
+  const rx = new RegExp("(" + query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "gi");
+  return e.replace(rx, "<mark>$1</mark>");
+};
+
+function threadHtml(r) {
+  if (!r.thread || !r.thread.length)
+    return '<div class="msg"><time></time><p style="color:var(--muted)">' +
+           'No prompts recorded — regenerate without --fast to include them.</p></div>';
+  return r.thread.map(m => {
+    const isHit = query && !m.gap && m.m.toLowerCase().includes(query);
+    return '<div class="msg' + (m.gap ? " gap" : "") + (isHit ? " hit" : "") + '">' +
+           "<time>" + (m.t ? clock(m.t) : "") + "</time><p>" + hl(m.m) + "</p></div>";
+  }).join("");
+}
+
 function render() {
-  const q = document.getElementById("q").value.toLowerCase().trim();
+  query = document.getElementById("q").value.toLowerCase().trim();
   const st = document.getElementById("state").value;
   const gb = document.getElementById("grp").value;
-  let rows = DATA.filter(r =>
-    (!st || r.state === st) &&
-    (!q || (r.cwd + " " + r.first + " " + r.last + " " + r.branch).toLowerCase().includes(q)));
+  const rows = DATA.filter(r => (!st || r.state === st) && (!query || r._hay.includes(query)));
   const out = document.getElementById("out");
   document.getElementById("sub").textContent =
-    rows.length + " of " + DATA.length + " conversations · click a command to copy it";
+    rows.length + " of " + DATA.length + " conversations · click one to read what you asked";
   if (!rows.length) { out.innerHTML = '<div class="empty">Nothing matches.</div>'; return; }
   const groups = new Map();
   for (const r of rows) {
@@ -936,36 +1032,74 @@ function render() {
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k).push(r);
   }
-  out.innerHTML = [...groups].map(([k, rs]) => `
-    <section class="grp">${k ? `<h2>${esc(k)}</h2>` : ""}
-    ${rs.map(r => `
-      <div class="card">
-        <div class="t">${esc(r.first) || "<em>no prompt yet</em>"}</div>
-        ${r.last && r.last !== r.first ? `<div class="l"><b>left off:</b> ${esc(r.last)}</div>` : ""}
-        <div class="meta">
-          <span class="chip ${r.state === "open" ? "open" : r.state === "archived" ? "arch" : ""}">${r.state}</span>
-          ${gb === "cwd" ? "" : `<span class="chip">${esc(short(r.cwd))}</span>`}
-          ${r.branch ? `<span class="chip">${esc(r.branch)}</span>` : ""}
-          <span>${when(r.ended)}</span>
-          <button class="cmd" data-c="cd ${esc(r.cwd)} &amp;&amp; claude --resume ${r.session}">resume ↗</button>
-        </div>
-      </div>`).join("")}
-    </section>`).join("");
+  out.innerHTML = [...groups].map(([k, rs]) => '<section class="grp">' +
+    (k ? "<h2>" + esc(k) + "</h2>" : "") +
+    rs.map(r => {
+      const hitsIn = query && (r.thread || []).some(m => !m.gap && m.m.toLowerCase().includes(query));
+      return '<details class="card" data-s="' + r.session + '"' + (hitsIn ? " open" : "") + '>' +
+        "<summary>" +
+          '<div class="t">' + (hl(r.first) || "<em>no prompt yet</em>") + "</div>" +
+          (r.last && r.last !== r.first
+            ? '<div class="l"><b>left off:</b> ' + hl(r.last) + "</div>" : "") +
+          '<div class="meta">' +
+            '<span class="chip ' + (r.state === "open" ? "open" : r.state === "archived" ? "arch" : "") +
+              '">' + r.state + "</span>" +
+            (gb === "cwd" ? "" : '<span class="chip">' + esc(short(r.cwd)) + "</span>") +
+            (r.branch ? '<span class="chip">' + esc(r.branch) + "</span>" : "") +
+            (r.n ? '<span class="chip">' + r.n + " prompts</span>" : "") +
+            (span(r) ? '<span class="chip">' + span(r) + "</span>" : "") +
+            "<span>" + when(r.ended) + "</span>" +
+            '<button class="cmd" data-c="cd ' + esc(r.cwd) +
+              " &amp;&amp; claude --resume " + r.session + '">resume ↗</button>' +
+          "</div>" +
+        "</summary>" +
+        '<div class="thread"></div></details>';
+    }).join("") + "</section>").join("");
+  document.querySelectorAll("details.card[open]").forEach(fill);
 }
+
+function fill(d) {
+  const box = d.querySelector(".thread");
+  if (box.dataset.done) return;
+  box.innerHTML = threadHtml(DATA.find(r => r.session === d.dataset.s));
+  box.dataset.done = "1";
+}
+
+document.addEventListener("toggle", e => {
+  if (e.target.matches("details.card") && e.target.open) fill(e.target);
+}, true);
+
+document.getElementById("expand").addEventListener("click", () => {
+  const cards = [...document.querySelectorAll("details.card")];
+  const opening = cards.some(c => !c.open);
+  cards.forEach(c => { c.open = opening; if (opening) fill(c); });
+  document.getElementById("expand").textContent = opening ? "collapse all" : "expand all";
+});
+
 document.addEventListener("click", e => {
-  const b = e.target.closest("button.cmd"); if (!b) return;
+  const b = e.target.closest("button.cmd");
+  if (!b) return;
+  e.preventDefault(); e.stopPropagation();
   const text = b.dataset.c;
   const done = () => { const o = b.textContent; b.textContent = "copied ✓";
     setTimeout(() => b.textContent = o, 1400); };
-  if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, fallback);
-  else fallback();
-  function fallback() {
+  const fallback = () => {
     const ta = document.createElement("textarea"); ta.value = text;
     document.body.appendChild(ta); ta.select();
     try { document.execCommand("copy"); done(); } catch (_) { prompt("Copy:", text); }
     ta.remove();
-  }
+  };
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, fallback);
+  else fallback();
 });
+
+document.addEventListener("keydown", e => {
+  if (e.key === "/" && document.activeElement.id !== "q") {
+    e.preventDefault(); document.getElementById("q").focus();
+  }
+  if (e.key === "Escape") document.querySelectorAll("details.card[open]").forEach(d => d.open = false);
+});
+
 for (const id of ["q", "state", "grp"])
   document.getElementById(id).addEventListener("input", render);
 render();
@@ -974,7 +1108,7 @@ render();
 
 
 def cmd_page(args):
-    rows = scan_library(days=None if args.all else args.days)
+    rows = scan_library(days=None if args.all else args.days, deep=not args.fast)
     live = {w.get("session") for w in match_sessions(discover())}
     snap = load() or {"saved": []}
     arch = {r["session"] for r in snap["saved"] if r.get("archived")}
@@ -1318,6 +1452,8 @@ def main():
     s.add_argument("--days", type=int, default=45)
     s.add_argument("--all", action="store_true", help="every conversation ever, not just recent")
     s.add_argument("--open", action="store_true", help="open it in the browser")
+    s.add_argument("--fast", action="store_true",
+                   help="skip reading the full conversations (no drill-down)")
     s.set_defaults(fn=cmd_page)
 
     s = sub.add_parser("archive", help="remember a conversation but stop reopening it")

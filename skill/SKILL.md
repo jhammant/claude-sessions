@@ -83,6 +83,13 @@ left off**, the directory and branch, whether it is open / closed / archived,
 and a click-to-copy `claude --resume` command. It is a plain file — regenerate
 it whenever, nothing is uploaded.
 
+Click a conversation to drill in: every prompt you typed, with times. The
+search box searches inside those threads too, opens the conversations that
+match, and highlights the hits — so "what was I doing about the retry bug"
+lands you on the right session even when the opening prompt never mentioned it.
+`/` focuses the search box, Escape collapses everything, and `--fast` skips
+reading the full transcripts if you only want the summary view.
+
 Only `entrypoint: cli` transcripts are listed. Hooks and scripts write
 `sdk-cli` / `sdk-py` transcripts into the same directories, and those are not
 conversations you had.

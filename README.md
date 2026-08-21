@@ -56,15 +56,17 @@ the conversation's first message:
 ## Finding a conversation again
 
 ```bash
-$ claude-sessions find gloss
-2 match(es) for 'gloss':
-  OPEN ~/dev  [ttys033, at 792,729]
-        how can i get glossfm ready to launch, even if just a small test
-        left off: could we monetise the free login with ads?
-       ~/dev/glossfm
-        Podcast player built for learning
-        cd ~/dev/glossfm && claude --resume 8f84baff-...
+$ claude-sessions find gateway
+2 match(es) for 'gateway':
+  OPEN ~/dev/api-gateway  [ttys021, at 1518,757]
+        rate limiter is dropping requests under load
+        left off: can we shed load per-tenant instead of globally?
+       ~/dev/gateway-docs
+        write up the retry semantics for the SDK teams
+        cd ~/dev/gateway-docs && claude --resume 8f84baff-...
 ```
+
+*(illustrative)*
 
 It searches directory, branch, first message and last message across every
 conversation, open or not. `--go` brings the top match's window forward if it's
@@ -84,6 +86,12 @@ claude-sessions page --open         # browse the lot
 every conversation: what you opened it with, **where you left off**, directory
 and branch, whether it's open / closed / archived, and a click-to-copy
 `claude --resume` command. Nothing is uploaded — it's a local file.
+
+Click a conversation to drill in: every prompt you typed, with times. Search
+runs over those threads too, auto-opens the conversations that match and
+highlights the hits, so you can find a session by something you said halfway
+through it. `/` focuses search, Escape collapses, `--fast` skips reading the
+full transcripts.
 
 ## Arranging windows
 
