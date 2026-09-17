@@ -87,6 +87,13 @@ def parse_etime(s):
 
 
 HEADLESS = re.compile(r'(^|\s)(-p|--print)(\s|$)')
+# launch flags that change how a window behaves, so a restored window must get them back
+KEEP_FLAGS = re.compile(r'(?:^|\s)(--dangerously-skip-permissions|--permission-mode(?:=|\s+)\S+)(?=\s|$)')
+
+
+def launch_flags(cmd):
+    """['--dangerously-skip-permissions'] etc. from a process command line."""
+    return [tok for m in KEEP_FLAGS.finditer(cmd) for tok in m.group(1).split()]
 
 
 def is_claude_cli(cmd):
@@ -135,6 +142,7 @@ def discover():
     for w in wins:
         rm = re.search(r'(?:--resume|-r)\s+([0-9a-fA-F-]{36})', w["cmd"])
         w["resumed"] = rm.group(1) if rm else None
+        w["flags"] = launch_flags(w["cmd"])
         w["cwd"] = pid_cwd(w["pid"])
         if not w["cwd"]:
             warn("could not read the working directory of pid %d (%s) — it will be missing "
@@ -402,6 +410,7 @@ def cmd_save(args):
             "cwd": w["cwd"],
             "session": w["session"],
             "title": title(f) if w["session"] and os.path.exists(f) else "",
+            "flags": w.get("flags") or [],
             "match": w["match"],
             "tty": w["tty"],
             "term": g.get("term"),
@@ -484,8 +493,15 @@ def cmd_list(args):
     return 0
 
 
+def claude_flags(r):
+    """The flags the window was launched with, else the CLAUDE_SESSIONS_CLAUDE_ARGS default."""
+    return r.get("flags") or shlex.split(os.environ.get("CLAUDE_SESSIONS_CLAUDE_ARGS", ""))
+
+
 def build_cmd(r):
     c = "cd %s && claude" % shlex.quote(r["cwd"])
+    for f in claude_flags(r):
+        c += " " + shlex.quote(f)
     if r.get("session"):
         c += " --resume %s" % r["session"]
     return c
@@ -980,7 +996,7 @@ PAGE = r"""<title>Claude Code sessions</title>
 <main id="out"></main>
 <script>
 const DATA = __DATA__;
-const esc = s => (s||"").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const esc = s => (s||"").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const short = p => p.replace(new RegExp("^/Users/[^/]+/"), "~/");
 const when = t => { const d = new Date(t); return isNaN(d) ? "" :
   d.toLocaleDateString(undefined,{month:"short",day:"numeric"}) + " " +
@@ -1049,8 +1065,7 @@ function render() {
             (r.n ? '<span class="chip">' + r.n + " prompts</span>" : "") +
             (span(r) ? '<span class="chip">' + span(r) + "</span>" : "") +
             "<span>" + when(r.ended) + "</span>" +
-            '<button class="cmd" data-c="cd ' + esc(r.cwd) +
-              " &amp;&amp; claude --resume " + r.session + '">resume ↗</button>' +
+            '<button class="cmd" data-c="' + esc(r.resume) + '">resume ↗</button>' +
           "</div>" +
         "</summary>" +
         '<div class="thread"></div></details>';
@@ -1113,11 +1128,14 @@ def cmd_page(args):
     snap = load() or {"saved": []}
     arch = {r["session"] for r in snap["saved"] if r.get("archived")}
     remembered = {r["session"] for r in snap["saved"] if not r.get("archived")}
+    flags = {r["session"]: r.get("flags") for r in snap["saved"] if r.get("session")}
     for r in rows:
         r["state"] = ("open" if r["session"] in live
                       else "archived" if r["session"] in arch
                       else "remembered" if r["session"] in remembered
                       else "closed")
+        r["resume"] = build_cmd({"cwd": r["cwd"], "session": r["session"],
+                                 "flags": flags.get(r["session"])})
     out = os.path.expanduser(args.out)
     # a conversation that mentions </script> would otherwise end the script block
     blob = json.dumps(rows).replace("</", "<\\/")
@@ -1215,6 +1233,7 @@ def cmd_find(args):
     rows = scan_library(days=None if args.all else args.days)
     snap = load() or {"saved": []}
     arch = {r["session"] for r in snap["saved"] if r.get("archived")}
+    flags = {r["session"]: r.get("flags") for r in snap["saved"] if r.get("session")}
 
     hits = []
     for r in rows:
@@ -1243,7 +1262,7 @@ def cmd_find(args):
                 return 0
             print("that window is open (%s, %s) but would not come forward" % (r["cwd"], w["tty"]))
             return 1
-        row = {"cwd": r["cwd"], "session": r["session"]}
+        row = {"cwd": r["cwd"], "session": r["session"], "flags": flags.get(r["session"])}
         term = terminal_app()
         if not term:
             print("neither iTerm2 nor Terminal is running")
@@ -1268,7 +1287,8 @@ def cmd_find(args):
         if r["last"] and r["last"] != r["first"]:
             print("        left off: %s" % r["last"][:100])
         if not r["open"]:
-            print("        cd %s && claude --resume %s" % (shlex.quote(r["cwd"]), r["session"]))
+            print("        " + build_cmd({"cwd": r["cwd"], "session": r["session"],
+                                          "flags": flags.get(r["session"])}))
     if len(hits) > args.limit:
         print("  ... and %d more" % (len(hits) - args.limit))
     if hits[0]["open"]:

@@ -71,6 +71,20 @@ reopened 5 of 5 window(s)
 
 *(output above is illustrative)*
 
+### Launch flags come back too
+
+A window started with `--dangerously-skip-permissions` or `--permission-mode <mode>`
+is reopened with the same flag — `save` reads it off the process command line.
+Windows with no recorded flag (older snapshots, or windows reopened by an earlier
+version) get `CLAUDE_SESSIONS_CLAUDE_ARGS` instead, if you set it:
+
+```bash
+export CLAUDE_SESSIONS_CLAUDE_ARGS="--dangerously-skip-permissions"   # e.g. in ~/.zshenv
+```
+
+The same flags go into the commands `find` prints and the page's resume button.
+Nothing is added unless the window had it or you set the variable.
+
 ## "Where's my gateway session — is it even open?"
 
 ```bash

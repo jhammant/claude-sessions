@@ -47,6 +47,11 @@ first user message so the list reads as something human.
 open, so running it twice does not give you duplicates. Each window comes back
 at its saved position unless you ask for a different `--layout`.
 
+Launch flags survive: a window started with `--dangerously-skip-permissions` or
+`--permission-mode <mode>` is reopened with it. A window with no recorded flag
+gets `CLAUDE_SESSIONS_CLAUDE_ARGS` (e.g. `--dangerously-skip-permissions`) if that
+is set; `find` and the page's resume button use the same rule.
+
 ## Finding a conversation again
 
 ```bash
