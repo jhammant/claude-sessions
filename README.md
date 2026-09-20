@@ -150,9 +150,9 @@ on purpose stays where you put it.
 ## Install
 
 ```bash
-git clone https://github.com/jhammant/claude-sessions ~/dev/claude-sessions
-ln -s ~/dev/claude-sessions/skill ~/.claude/skills/claude-sessions          # as a skill
-ln -s ~/dev/claude-sessions/skill/scripts/claude-sessions ~/.local/bin/     # as a CLI
+git clone https://github.com/jhammant/claude-sessions ~/dev/utilities/claude-sessions
+ln -s ~/dev/utilities/claude-sessions/skill ~/.claude/skills/claude-sessions          # as a skill
+ln -s ~/dev/utilities/claude-sessions/skill/scripts/claude-sessions ~/.local/bin/     # as a CLI
 ```
 
 No dependencies beyond python3 and macOS. A skill is enumerated when a Claude
