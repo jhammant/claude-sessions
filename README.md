@@ -162,7 +162,12 @@ name waits for the hook. `/rename` runs even while a window is busy, without
 interrupting it.
 
 `list`, `find`, `page` and the snapshot show these names rather than the
-opening prompt.
+opening prompt. To see the name in Claude Code's status line too, read
+`session_name` from the JSON your `statusLine` command receives:
+
+```bash
+name=$(jq -r '.session_name // empty' | tr -d '\\')   # empty until the window has a name
+```
 
 ## Remembering what you closed
 
