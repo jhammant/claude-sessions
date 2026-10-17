@@ -133,6 +133,7 @@ Nothing is uploaded. It's a local file.
 ## Arranging windows
 
 ```bash
+claude-sessions arrange                      # smart: the windows you used last get the most room, every screen filled
 claude-sessions arrange grid                 # tile everything that's open
 claude-sessions arrange grid --cols 4
 claude-sessions arrange cascade

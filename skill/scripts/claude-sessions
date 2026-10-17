@@ -207,7 +207,8 @@ def terminal_app():
 
 
 def geometry():
-    """tty -> {'term': app, 'bounds': [l, t, r, b]}"""
+    """tty -> {'term': app, 'bounds': [l, t, r, b], 'z': n}. The terminal lists windows front to back,
+    so z is how recently you were in each one: 0 is the window you used last."""
     g = {}
     for app, script in (("iTerm2", GEOM_AS % "iTerm2"), ("Terminal", GEOM_TERMINAL)):
         if not app_running(app):
@@ -220,7 +221,7 @@ def geometry():
             f = line.split("\t")
             if len(f) == 5:
                 try:
-                    g[f[0].strip()] = {"term": app, "bounds": [int(x) for x in f[1:]]}
+                    g[f[0].strip()] = {"term": app, "bounds": [int(x) for x in f[1:]], "z": len(g)}
                 except ValueError:
                     pass
     return g
@@ -546,21 +547,99 @@ def layout_rects(rows, mode, cols=None, rect=None):
                 + grid_rects(n - 1, [split, t, r_, b], cols or max(1, math.ceil((n - 1) / 6))))
     if mode == "columns":
         return grid_rects(n, rect, cols or n)
+    if mode == "smart":
+        return smart_rects(n, rect)
     return grid_rects(n, rect, cols or max(1, math.ceil(math.sqrt(n))))
 
 
+GAP = 4
+MIN_W, MIN_H = 480, 240  # a terminal smaller than this isn't worth looking at
+
+
 def grid_rects(n, rect, cols):
+    """An even grid with no empty cells: when n doesn't fill the last row, the rows share the
+    windows out (5 in 3 columns is a row of 3 over a row of 2, each a little wider)."""
     l, t, r_, b = rect
     c = max(1, min(cols, n))
     rws = max(1, math.ceil(n / c))
-    cw, ch = (r_ - l) // c, (b - t) // rws
-    gap = 4
+    base, extra = divmod(n, rws)
     out = []
-    for i in range(n):
-        cx, cy = i % c, i // c
-        out.append([l + cx * cw + gap, t + cy * ch + gap,
-                    l + (cx + 1) * cw - gap, t + (cy + 1) * ch - gap])
+    for row in range(rws):
+        k = base + (1 if row < extra else 0)
+        top, bottom = t + round(row * (b - t) / rws), t + round((row + 1) * (b - t) / rws)
+        for i in range(k):
+            left, right = l + round(i * (r_ - l) / k), l + round((i + 1) * (r_ - l) / k)
+            out.append([left + GAP, top + GAP, right - GAP, bottom - GAP])
     return out
+
+
+def smart_rects(n, rect):
+    """The first window (the one you used last) gets the most room, the next a little less, and
+    so on, filling the whole rect. If that would make any window too small to use, the sizes even
+    out, down to a plain grid when the screen is crowded."""
+    weights = [1 + 2 * 0.5 ** i for i in range(n)]  # 3, 2, 1.5, 1.25, ... times the room
+    for k in (1, 0.75, 0.5, 0.25):
+        tiles = squarify([1 + k * (w - 1) for w in weights], rect)
+        if all(r - l - 2 * GAP >= MIN_W and b - t - 2 * GAP >= MIN_H for l, t, r, b in tiles):
+            return [[l + GAP, t + GAP, r - GAP, b - GAP] for l, t, r, b in tiles]
+    return grid_rects(n, rect, max(1, math.ceil(math.sqrt(n))))
+
+
+def squarify(weights, rect):
+    """Squarified treemap (Bruls, Huizing and van Wijk, 2000): tiles whose areas follow the
+    weights, largest first from the top left, filling rect exactly and kept close to square."""
+    l, t, r_, b = rect
+    total = float(sum(weights))
+    areas = [w * (r_ - l) * (b - t) / total for w in weights]
+    x, y, w, h = float(l), float(t), float(r_ - l), float(b - t)
+
+    def worst(row, side):
+        s = sum(row)
+        return max(max(side * side * a / (s * s), s * s / (side * side * a)) for a in row)
+
+    out, i = [], 0
+    while i < len(areas):
+        side = min(w, h)
+        row = [areas[i]]
+        i += 1
+        while i < len(areas) and worst(row + [areas[i]], side) <= worst(row, side):
+            row.append(areas[i])
+            i += 1
+        s = sum(row)
+        if w >= h:  # a column down the left of what's left
+            cw, yy = s / h, y
+            for a in row:
+                out.append([x, yy, x + cw, yy + a / cw])
+                yy += a / cw
+            x, w = x + cw, w - cw
+        else:  # a row across the top of what's left
+            rh, xx = s / w, x
+            for a in row:
+                out.append([xx, y, xx + a / rh, y + rh])
+                xx += a / rh
+            y, h = y + rh, h - rh
+    # shared edges round the same way, so neighbours meet without gaps or overlaps
+    return [[int(round(v)) for v in tile] for tile in out]
+
+
+def split_by_display(wins, screens):
+    """[(display rect, its windows)]: each window stays on the display that holds its centre
+    (the nearest one if none does), so tiling fills every screen you use."""
+    if not screens:
+        return [(None, wins)]
+    groups = [[] for _ in screens]
+    for w in wins:
+        b = w.get("bounds")
+        if not b:
+            groups[0].append(w)
+            continue
+        cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+
+        def distance(sc):
+            l, t, r_, bt = sc["rect"]
+            return math.hypot(max(l - cx, 0, cx - r_), max(t - cy, 0, cy - bt))
+        groups[min(range(len(screens)), key=lambda i: distance(screens[i]))].append(w)
+    return [(sc["rect"], g) for sc, g in zip(screens, groups) if g]
 
 
 DISPLAYS_JXA = r"""
@@ -832,21 +911,32 @@ def arrange_once(args):
         rows = [{"bounds": pos.get(w.get("session"))} for w in wins]
         rects = [r["bounds"] for r in rows]
     else:
+        def activity(w):
+            f = os.path.join(PROJ, enc(w["cwd"]), (w.get("session") or "") + ".jsonl")
+            try:
+                return -os.path.getmtime(f)
+            except OSError:
+                return 0
+
         for w in wins:
             w["bounds"] = geo.get(w["tty"], {}).get("bounds")
-        if args.busy_first:
+            w["z"] = geo.get(w["tty"], {}).get("z", 10 ** 6)
+        if args.mode == "smart":
+            # the window you were in last first; a tie goes to the one Claude wrote to last
+            wins.sort(key=lambda w: (w["z"], activity(w)))
+        elif args.busy_first:
             # a session being written to right now is one you are waiting on, so give
             # it the first cell of the grid
-            def activity(w):
-                f = os.path.join(PROJ, enc(w["cwd"]), (w.get("session") or "") + ".jsonl")
-                try:
-                    return -os.path.getmtime(f)
-                except OSError:
-                    return 0
             wins.sort(key=activity)
         else:
             wins.sort(key=lambda w: (w["cwd"], w.get("session") or ""))
-        rects = layout_rects(wins, args.mode, cols=args.cols, rect=resolve_rect(args))
+        rect = resolve_rect(args)
+        # with no --rect or --display, fill each screen the windows are on, all of it
+        groups = split_by_display(wins, displays()) if rect is None and args.mode != "cascade" else [(rect, wins)]
+        wins, rects = [], []
+        for area, group in groups:
+            wins += group
+            rects += layout_rects(group, args.mode, cols=args.cols, rect=area)
 
     moved = 0
     for w, bb in zip(wins, rects):
@@ -1529,8 +1619,9 @@ def main():
     s.set_defaults(fn=cmd_restore)
 
     s = sub.add_parser("arrange", help="retile the windows that are open now")
-    s.add_argument("mode", nargs="?", choices=["grid", "focus", "columns", "cascade", "saved"], default="grid",
-                   help="focus: the first window big on the left, the rest stacked beside it; "
+    s.add_argument("mode", nargs="?", choices=["smart", "grid", "focus", "columns", "cascade", "saved"], default="smart",
+                   help="smart: the windows you used last get the most room, filling each screen; "
+                        "focus: the first window big on the left, the rest stacked beside it; "
                         "columns: side by side")
     s.add_argument("--cols", type=int)
     s.add_argument("--rect", type=rect_arg)
@@ -1544,7 +1635,7 @@ def main():
     s.set_defaults(fn=cmd_arrange)
 
     s = sub.add_parser("install-arrange", help="auto-arrange windows as they open and close")
-    s.add_argument("mode", nargs="?", choices=["grid", "focus", "columns", "cascade", "saved"], default="grid")
+    s.add_argument("mode", nargs="?", choices=["smart", "grid", "focus", "columns", "cascade", "saved"], default="smart")
     s.add_argument("--cols", type=int)
     s.add_argument("--rect", type=rect_arg)
     s.add_argument("--display", help="lay out on one display: main, its number, or part of its name")
