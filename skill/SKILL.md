@@ -1,6 +1,6 @@
 ---
 name: claude-sessions
-description: Save, restore, find and arrange Claude Code windows — which directories were open, which conversation each was on, where each window sat on screen — plus a searchable library of every past conversation. Use when the user says "save my sessions", "restore my claude windows", "reopen everything", "I need to restart, don't lose my sessions", "how do I get all my windows back", "resume all my conversations", "arrange my claude windows", "where is my <project> session", "find the window I was using for X", "which window is that in", "what was I doing in X", or asks how Claude Code session persistence works. Also use to set up an automatic periodic snapshot.
+description: Save, restore, find, name and arrange Claude Code windows — which directories were open, which conversation each was on, where each window sat on screen — plus a searchable library of every past conversation. Use when the user says "save my sessions", "restore my claude windows", "reopen everything", "I need to restart, don't lose my sessions", "how do I get all my windows back", "resume all my conversations", "arrange my claude windows", "where is my <project> session", "rename my windows", "the window names are wrong", "find the window I was using for X", "which window is that in", "what was I doing in X", or asks how Claude Code session persistence works. Also use to set up an automatic periodic snapshot.
 ---
 
 # claude-sessions — save, restore and arrange your open Claude Code windows
@@ -64,6 +64,26 @@ conversation — open or not. Open ones sort first and show the tty and screen
 position they are on. `--go` acts on the top match: it brings that window
 forward if it is running, and reopens it if it is not. This is the answer to
 "where is my X session, and is it even open?".
+
+## Naming windows after what they are doing now
+
+Window names drift: Claude Code names a window after its folder or first prompt.
+`namer.py` keeps each name on the current job, as `<Project> · <task>`.
+
+```bash
+claude-sessions name list                 # each open window's name, pending name, lock
+claude-sessions name apply [--yes]        # suggest names for every open window, then rename
+claude-sessions name set <id> <name...>   # name one window now (--lock keeps it)
+claude-sessions name lock|unlock <id>
+```
+
+The `UserPromptSubmit` hook (`namer.py hook`, see the README) refreshes names on
+the first prompt and every five prompts after fifteen minutes, via a model already
+loaded in LM Studio or else Haiku. A `/rename` by hand locks that window. `set`
+and `apply` type `/rename` into an iTerm2 window only when its input box is empty
+and no dialog is open; otherwise the name is queued for the hook. When the user
+asks "which window is which" or the names look stale, run `name list`, then
+`name apply` and show the plan before `--yes`.
 
 ## Remembering what you closed
 

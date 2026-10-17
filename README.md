@@ -107,6 +107,63 @@ It searches the directory, branch, opening prompt, last prompt and the whole
 thread of every conversation — open or not. `--go` brings the top match's window
 to the front if it's running, and reopens it if it isn't.
 
+## Windows named after what they're doing now
+
+Claude Code names a window after its folder (`dev-2f`) or titles it from the
+first prompt. Long sessions drift: the window that began as "what's running on
+this machine?" is backfilling market data a day later, and fourteen windows
+called `dev-*` are fourteen guesses.
+
+`namer.py` keeps each window's name on its current job, as `<Project> · <task>`:
+
+```text
+$ claude-sessions name list
+1669805d   Shop · App Store go-live                     idle
+371e265a   Ledger · nightly backup fix                  busy
+2c693198   web-app · passkeys                           shell
+78eb67d4   brochure-fb                                  idle     pending: Acme · conference print
+```
+
+Install it as a `UserPromptSubmit` hook in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "timeout": 5,
+                    "command": "python3 ~/.claude/skills/claude-sessions/scripts/namer.py hook" }] }
+    ]
+  }
+}
+```
+
+On the first prompt, and again every five prompts once fifteen minutes have
+passed, the hook asks a small model (a model already loaded in LM Studio,
+otherwise Haiku via `claude -p`) to name what the latest prompts are about. The
+name lands at the next prompt through the hook's `sessionTitle` output, which
+renames the window everywhere: the prompt box, the terminal title, the `/resume`
+picker and its peer name. The hook itself returns in under 0.1 s and never
+blocks a prompt.
+
+A name you give a window yourself, with `/rename` or `--name`, is never
+overwritten: the hook notices a title it didn't set and locks that window.
+
+```bash
+claude-sessions name apply          # suggest a name for every open window (dry run)
+claude-sessions name apply --yes    # ...and rename them now
+claude-sessions name set 2c69 web-app · passkeys     # name one window now
+claude-sessions name lock 2c69      # leave this one alone; `unlock` hands it back
+```
+
+`apply` and `set` rename open windows straight away by typing `/rename` into
+them, in iTerm2, and only when the input box is visibly empty and no dialog is
+open. A half-typed prompt or an open permission prompt is left alone, and the
+name waits for the hook. `/rename` runs even while a window is busy, without
+interrupting it.
+
+`list`, `find`, `page` and the snapshot show these names rather than the
+opening prompt.
+
 ## Remembering what you closed
 
 A window you closed on purpose should be remembered, not reopened:
