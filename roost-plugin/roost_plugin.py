@@ -17,7 +17,7 @@ SNAPSHOT = HOME / ".claude/session-restore.json"
 ARRANGE_PLIST = HOME / "Library/LaunchAgents/dev.claudesessions.arrange.plist"
 SNAPSHOT_PLIST = HOME / "Library/LaunchAgents/dev.claudesessions.snapshot.plist"
 # One-press shortcuts Roost registers system-wide; shown beside the items in the menu.
-HOTKEYS = {"grid": "ctrl+opt+cmd+g", "focus": "ctrl+opt+cmd+f"}
+HOTKEYS = {"smart": "ctrl+opt+cmd+s", "grid": "ctrl+opt+cmd+g", "focus": "ctrl+opt+cmd+f"}
 LAYOUTS = [("smart", "Smart: the windows you used last get the most room"),
            ("grid", "Grid, busiest first"),
            ("focus", "Focus: busiest big, the rest beside it"),
