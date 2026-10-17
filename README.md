@@ -139,8 +139,18 @@ claude-sessions arrange cascade
 claude-sessions arrange saved                # back to the snapshot's positions
 claude-sessions arrange grid --busy-first    # sessions working right now get the first cells
 claude-sessions arrange grid --rect 0,0,2560,1440   # confine to one display
+claude-sessions arrange focus --busy-first   # the busiest window big on the left, the rest stacked beside it
+claude-sessions arrange columns              # side by side
+claude-sessions arrange grid --display 2     # one display only: main, its number, or part of its name
+claude-sessions displays                     # the displays --display can name
 
 claude-sessions install-arrange grid --busy-first   # do it automatically
+```
+
+In the menu bar: [Roost](https://github.com/jhammant/roost) shows all of this as an *Organise Claude windows* section: ⌃⌥⌘G tiles a grid and ⌃⌥⌘F the focus layout from anywhere, and every layout is one click away (per display, auto-tile on or off, reopen a closed window, snapshots). The plugin is in [`roost-plugin/`](roost-plugin/):
+
+```bash
+Roost --install-plugin roost-plugin
 ```
 
 `restore` also takes `--layout grid|cascade|saved|none`. The automatic mode

@@ -1,0 +1,9 @@
+{
+  "id": "claude-sessions",
+  "name": "Organise Claude windows",
+  "description": "Tile, focus and reopen your Claude Code windows: grid, focus, side by side, per display, auto-tile and snapshots",
+  "version": "0.1.0",
+  "command": ["/usr/bin/python3", "./roost_plugin.py"],
+  "interval": 60,
+  "timeout": 15
+}

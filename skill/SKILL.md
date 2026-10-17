@@ -141,6 +141,10 @@ claude-sessions arrange cascade
 claude-sessions arrange saved                # back to the snapshot's positions
 claude-sessions arrange grid --busy-first    # sessions working right now get the first cells
 claude-sessions arrange grid --rect 0,0,2560,1440   # confine to one display
+claude-sessions arrange focus --busy-first   # the busiest window big on the left, the rest stacked beside it
+claude-sessions arrange columns              # side by side
+claude-sessions arrange grid --display 2     # one display only: main, its number, or part of its name
+claude-sessions displays                     # the displays --display can name
 ```
 
 Without `--rect` it tiles inside the bounding box of the windows already on
@@ -155,6 +159,8 @@ claude-sessions uninstall-arrange
 
 That re-tiles **only when a window opens or closes**, so a window you drag
 somewhere on purpose stays where you put it.
+
+The same controls are in the menu bar as Roost's *Organise Claude windows* section, with system-wide shortcuts ⌃⌥⌘G (grid, busiest first) and ⌃⌥⌘F (focus) (`Roost --install-plugin ~/dev/utilities/claude-sessions/roost-plugin`).
 
 Note that a freshly created terminal window is still being placed by the
 terminal, so its position has to be applied after a short settle and applied
