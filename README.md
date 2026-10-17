@@ -147,7 +147,7 @@ claude-sessions displays                     # the displays --display can name
 claude-sessions install-arrange grid --busy-first   # do it automatically
 ```
 
-In the menu bar: [Roost](https://github.com/jhammant/roost) shows all of this as a *Claude Code* section (every layout one click away, per display, auto-tile on or off, reopen a closed window, snapshots). The plugin is in [`roost-plugin/`](roost-plugin/):
+In the menu bar: [Roost](https://github.com/jhammant/roost) shows all of this as an *Organise Claude windows* section: ⌃⌥⌘G tiles a grid and ⌃⌥⌘F the focus layout from anywhere, and every layout is one click away (per display, auto-tile on or off, reopen a closed window, snapshots). The plugin is in [`roost-plugin/`](roost-plugin/):
 
 ```bash
 Roost --install-plugin roost-plugin

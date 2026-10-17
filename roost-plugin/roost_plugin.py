@@ -16,11 +16,15 @@ TOOL = Path(__file__).resolve().parent.parent / "skill/scripts/claude-sessions"
 SNAPSHOT = HOME / ".claude/session-restore.json"
 ARRANGE_PLIST = HOME / "Library/LaunchAgents/dev.claudesessions.arrange.plist"
 SNAPSHOT_PLIST = HOME / "Library/LaunchAgents/dev.claudesessions.snapshot.plist"
-LAYOUTS = [("grid", "Grid, busiest first"),
+# One-press shortcuts Roost registers system-wide; shown beside the items in the menu.
+HOTKEYS = {"grid": "ctrl+opt+cmd+g", "focus": "ctrl+opt+cmd+f"}
+LAYOUTS = [("smart", "Smart: the windows you used last get the most room"),
+           ("grid", "Grid, busiest first"),
            ("focus", "Focus: busiest big, the rest beside it"),
            ("columns", "Side by side"),
            ("cascade", "Cascade")]
 SEPARATOR = {"separator": True}
+TITLE = "Organise Claude windows"
 
 
 def cs(*args):
@@ -86,7 +90,8 @@ def ago(ts):
 
 def layout_items(windows):
     """The layouts, one click each, applied to every open window."""
-    return [{"title": title, "run": cs("arrange", mode, "--busy-first")}
+    return [{"title": title, "run": cs("arrange", mode, "--busy-first"),
+             **({"hotkey": HOTKEYS[mode]} if mode in HOTKEYS else {})}
             for mode, title in LAYOUTS if mode != "columns" or windows <= 6]
 
 
@@ -133,7 +138,7 @@ def reopen_items():
 
 def main():
     if not TOOL.exists():
-        print(json.dumps({"title": "Claude Code", "items": [{"title": f"claude-sessions not found at {TOOL}"}]}))
+        print(json.dumps({"title": TITLE, "items": [{"title": f"claude-sessions not found at {TOOL}"}]}))
         return
     windows, screens = open_windows(), displays()
     auto = auto_tile_mode()
@@ -156,7 +161,7 @@ def main():
         {"title": "Browse every conversation…", "run": cs("page", "--open", "--fast"),
          "tooltip": "A searchable page of every Claude Code conversation, open or closed"},
     ]
-    print(json.dumps({"title": "Claude Code", "items": items}))
+    print(json.dumps({"title": TITLE, "items": items}))
 
 
 if __name__ == "__main__":

@@ -160,7 +160,7 @@ claude-sessions uninstall-arrange
 That re-tiles **only when a window opens or closes**, so a window you drag
 somewhere on purpose stays where you put it.
 
-The same controls are in the menu bar as Roost's *Claude Code* section (`Roost --install-plugin ~/dev/utilities/claude-sessions/roost-plugin`).
+The same controls are in the menu bar as Roost's *Organise Claude windows* section, with system-wide shortcuts ⌃⌥⌘G (grid, busiest first) and ⌃⌥⌘F (focus) (`Roost --install-plugin ~/dev/utilities/claude-sessions/roost-plugin`).
 
 Note that a freshly created terminal window is still being placed by the
 terminal, so its position has to be applied after a short settle and applied
