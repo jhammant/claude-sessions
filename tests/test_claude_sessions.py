@@ -76,3 +76,45 @@ class SaveTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Layouts(unittest.TestCase):
+    RECT = [0, 0, 1000, 600]
+
+    def test_focus_gives_the_first_window_the_left_sixty_percent(self):
+        # Arrange
+        rows = [{}] * 4
+        # Act
+        rects = cs.layout_rects(rows, 'focus', rect=self.RECT)
+        # Assert
+        self.assertEqual(rects[0], [4, 4, 596, 596])
+        self.assertTrue(all(r[0] >= 600 for r in rects[1:]))  # the rest share the right strip
+        self.assertEqual([r[1] for r in rects[1:]], [4, 204, 404])  # stacked, one above the other
+
+    def test_focus_with_one_window_is_just_the_grid(self):
+        self.assertEqual(cs.layout_rects([{}], 'focus', rect=self.RECT), [[4, 4, 996, 596]])
+
+    def test_columns_puts_every_window_side_by_side(self):
+        rects = cs.layout_rects([{}] * 3, 'columns', rect=[0, 0, 900, 600])
+        self.assertEqual([r[0] for r in rects], [4, 304, 604])
+        self.assertTrue(all(r[3] == 596 for r in rects))
+
+
+class Displays(unittest.TestCase):
+    SCREENS = [{'name': 'Studio', 'rect': [0, 30, 2560, 1380]},
+               {'name': 'LG HDR 4K', 'rect': [2560, 110, 5120, 1550]}]
+
+    def test_screen_rect_flips_appkit_coordinates(self):
+        # Arrange: a display to the right whose bottom sits 110 px below the main one's
+        sc = {'name': 'LG', 'x': 2560, 'y': -110, 'w': 2560, 'h': 1440}
+        # Act
+        rect = cs.screen_rect(sc, 1440)['rect']
+        # Assert
+        self.assertEqual(rect, [2560, 110, 5120, 1550])
+
+    def test_display_rect_by_main_number_or_name(self):
+        self.assertEqual(cs.display_rect('main', self.SCREENS), [0, 30, 2560, 1380])
+        self.assertEqual(cs.display_rect('2', self.SCREENS), [2560, 110, 5120, 1550])
+        self.assertEqual(cs.display_rect('lg', self.SCREENS), [2560, 110, 5120, 1550])
+        self.assertIsNone(cs.display_rect('3', self.SCREENS))
+        self.assertIsNone(cs.display_rect('dell', self.SCREENS))

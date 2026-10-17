@@ -15,6 +15,9 @@ sat on screen. This records that, and replays it.
     claude-sessions restore --dry-run    print what it would do
     claude-sessions restore --layout grid
     claude-sessions arrange grid         retile the windows that are open now
+    claude-sessions arrange focus --busy-first   busiest window big, the rest stacked beside it
+    claude-sessions arrange columns --display 2  side by side on the second display
+    claude-sessions displays             the displays --display can name
     claude-sessions doctor               show what it can and cannot see
     claude-sessions install-auto [secs]  periodic snapshot via launchd
     claude-sessions uninstall-auto
@@ -535,7 +538,20 @@ def layout_rects(rows, mode, cols=None, rect=None):
                  t + (i * step) % max(1, (b - t - h)),
                  l + (i * step) % max(1, (r_ - l - w)) + w,
                  t + (i * step) % max(1, (b - t - h)) + h] for i in range(n)]
-    c = cols or max(1, math.ceil(math.sqrt(n)))
+    if mode == "focus" and n > 1:
+        # the first window (the busiest, with --busy-first) gets the left 60%; the rest
+        # share the right-hand strip, stacked one above the other in as few columns as fit
+        split = l + int((r_ - l) * 0.6)
+        return ([[l + 4, t + 4, split - 4, b - 4]]
+                + grid_rects(n - 1, [split, t, r_, b], cols or max(1, math.ceil((n - 1) / 6))))
+    if mode == "columns":
+        return grid_rects(n, rect, cols or n)
+    return grid_rects(n, rect, cols or max(1, math.ceil(math.sqrt(n))))
+
+
+def grid_rects(n, rect, cols):
+    l, t, r_, b = rect
+    c = max(1, min(cols, n))
     rws = max(1, math.ceil(n / c))
     cw, ch = (r_ - l) // c, (b - t) // rws
     gap = 4
@@ -545,6 +561,71 @@ def layout_rects(rows, mode, cols=None, rect=None):
         out.append([l + cx * cw + gap, t + cy * ch + gap,
                     l + (cx + 1) * cw - gap, t + (cy + 1) * ch - gap])
     return out
+
+
+DISPLAYS_JXA = r"""
+ObjC.import("AppKit");
+var s = $.NSScreen.screens, out = [];
+for (var i = 0; i < s.count; i++) {
+  var sc = s.objectAtIndex(i), v = sc.visibleFrame;
+  out.push({name: sc.localizedName.js, x: v.origin.x, y: v.origin.y, w: v.size.width, h: v.size.height});
+}
+JSON.stringify({mainHeight: s.objectAtIndex(0).frame.size.height, screens: out});
+"""
+
+
+def displays():
+    """Each display's usable area (no menu bar or Dock) as [left, top, right, bottom] in the
+    top-left coordinates window bounds use. The main display comes first."""
+    try:
+        p = subprocess.run(["osascript", "-l", "JavaScript", "-"], input=DISPLAYS_JXA,
+                           capture_output=True, text=True, timeout=10)
+        data = json.loads(p.stdout)
+    except Exception:
+        return []
+    return [screen_rect(sc, data["mainHeight"]) for sc in data["screens"]]
+
+
+def screen_rect(sc, main_height):
+    """AppKit measures up from the bottom of the main display; window bounds measure down from its top."""
+    top = int(main_height - (sc["y"] + sc["h"]))
+    return {"name": sc["name"], "rect": [int(sc["x"]), top, int(sc["x"] + sc["w"]), top + int(sc["h"])]}
+
+
+def display_rect(which, screens=None):
+    """`main`, a 1-based number, or part of a display's name."""
+    screens = displays() if screens is None else screens
+    if not screens:
+        return None
+    if which in ("main", ""):
+        return screens[0]["rect"]
+    if which.isdigit():
+        i = int(which) - 1
+        return screens[i]["rect"] if 0 <= i < len(screens) else None
+    hit = [sc for sc in screens if which.lower() in sc["name"].lower()]
+    return hit[0]["rect"] if hit else None
+
+
+def resolve_rect(args):
+    """--display wins over --rect; an unknown display is an error rather than a silent guess."""
+    which = getattr(args, "display", None)
+    if not which:
+        return args.rect
+    rect = display_rect(which)
+    if rect is None:
+        names = ", ".join("%d %s" % (i + 1, sc["name"]) for i, sc in enumerate(displays()))
+        sys.exit("no display matches %r (have: %s)" % (which, names or "none found"))
+    return rect
+
+
+def cmd_displays(args):
+    screens = displays()
+    if args.json:
+        print(json.dumps(screens))
+        return 0
+    for i, sc in enumerate(screens):
+        print("%d  %-24s %s%s" % (i + 1, sc["name"], ",".join(map(str, sc["rect"])), "  (main)" if i == 0 else ""))
+    return 0
 
 
 NEW_WINDOW_ITERM = '''
@@ -634,7 +715,7 @@ def cmd_restore(args):
     if archived and not args.include_archived:
         print("(%d archived window(s) left closed — see `claude-sessions page`)" % len(archived))
 
-    rects = layout_rects(rows, args.layout, cols=args.cols, rect=args.rect)
+    rects = layout_rects(rows, args.layout, cols=args.cols, rect=resolve_rect(args))
 
     if args.dry_run:
         print("would reopen %d window(s)%s:"
@@ -765,7 +846,7 @@ def arrange_once(args):
             wins.sort(key=activity)
         else:
             wins.sort(key=lambda w: (w["cwd"], w.get("session") or ""))
-        rects = layout_rects(wins, args.mode, cols=args.cols, rect=args.rect)
+        rects = layout_rects(wins, args.mode, cols=args.cols, rect=resolve_rect(args))
 
     moved = 0
     for w, bb in zip(wins, rects):
@@ -1374,6 +1455,8 @@ def cmd_install_arrange(args):
         argv += ["--cols", str(args.cols)]
     if args.rect:
         argv += ["--rect", ",".join(str(x) for x in args.rect)]
+    if args.display:
+        argv += ["--display", args.display]
     if args.busy_first:
         argv.append("--busy-first")
     body = "".join("<string>%s</string>" % a for a in argv)
@@ -1434,9 +1517,10 @@ def main():
     s = sub.add_parser("restore", help="reopen the windows that are missing")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--tabs", action="store_true", help="reopen as tabs in one window")
-    s.add_argument("--layout", choices=["saved", "grid", "cascade", "none"], default="saved")
+    s.add_argument("--layout", choices=["saved", "grid", "focus", "columns", "cascade", "none"], default="saved")
     s.add_argument("--cols", type=int)
     s.add_argument("--rect", type=rect_arg, help="left,top,right,bottom to lay out inside")
+    s.add_argument("--display", help="lay out on one display: main, its number, or part of its name")
     s.add_argument("--force", action="store_true", help="reopen even what is already open")
     s.add_argument("--pace", type=float, default=0.5, help="seconds between windows")
     s.add_argument("--source", help="snapshot file, or an index from `list --history`")
@@ -1445,9 +1529,12 @@ def main():
     s.set_defaults(fn=cmd_restore)
 
     s = sub.add_parser("arrange", help="retile the windows that are open now")
-    s.add_argument("mode", nargs="?", choices=["grid", "cascade", "saved"], default="grid")
+    s.add_argument("mode", nargs="?", choices=["grid", "focus", "columns", "cascade", "saved"], default="grid",
+                   help="focus: the first window big on the left, the rest stacked beside it; "
+                        "columns: side by side")
     s.add_argument("--cols", type=int)
     s.add_argument("--rect", type=rect_arg)
+    s.add_argument("--display", help="lay out on one display: main, its number, or part of its name")
     s.add_argument("--busy-first", action="store_true",
                    help="put the sessions that are working right now in the first cells")
     s.add_argument("--watch", action="store_true",
@@ -1457,9 +1544,10 @@ def main():
     s.set_defaults(fn=cmd_arrange)
 
     s = sub.add_parser("install-arrange", help="auto-arrange windows as they open and close")
-    s.add_argument("mode", nargs="?", choices=["grid", "cascade", "saved"], default="grid")
+    s.add_argument("mode", nargs="?", choices=["grid", "focus", "columns", "cascade", "saved"], default="grid")
     s.add_argument("--cols", type=int)
     s.add_argument("--rect", type=rect_arg)
+    s.add_argument("--display", help="lay out on one display: main, its number, or part of its name")
     s.add_argument("--busy-first", action="store_true")
     s.add_argument("--every", type=int, default=10)
     s.set_defaults(fn=cmd_install_arrange)
@@ -1490,6 +1578,10 @@ def main():
     s.add_argument("--all", action="store_true")
     s.add_argument("--limit", type=int, default=8)
     s.set_defaults(fn=cmd_find)
+
+    s = sub.add_parser("displays", help="list the displays --display can name")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_displays)
 
     s = sub.add_parser("doctor", help="show what it can and cannot see")
     s.set_defaults(fn=cmd_doctor)
