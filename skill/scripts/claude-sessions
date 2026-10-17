@@ -19,6 +19,7 @@ sat on screen. This records that, and replays it.
     claude-sessions arrange columns --display 2  side by side on the second display
     claude-sessions displays             the displays --display can name
     claude-sessions doctor               show what it can and cannot see
+    claude-sessions name list            each open window's name; `name apply`, `name set` rename them
     claude-sessions install-auto [secs]  periodic snapshot via launchd
     claude-sessions uninstall-auto
 """
@@ -34,6 +35,9 @@ import shlex
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import namer  # noqa: E402  (sits next to this script)
 
 HOME = os.path.expanduser("~")
 STATE = os.environ.get("CLAUDE_SESSIONS_STATE", os.path.join(HOME, ".claude", "session-restore.json"))
@@ -283,6 +287,10 @@ def transcripts(cwd, interactive_only=True):
 
 
 def title(path):
+    """The window's name if it has one (/rename, --name, the namer hook), else its first prompt."""
+    named = namer.last_custom_title(path)
+    if named:
+        return named[:90]
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -1676,6 +1684,11 @@ def main():
 
     s = sub.add_parser("doctor", help="show what it can and cannot see")
     s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("name", help="name windows after what they are doing now (see namer.py)",
+                       add_help=False)
+    s.add_argument("rest", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=lambda a: namer.main(a.rest or ["--help"]))
 
     s = sub.add_parser("install-auto", help="periodic snapshot via launchd")
     s.add_argument("seconds", nargs="?", type=int, default=600)
